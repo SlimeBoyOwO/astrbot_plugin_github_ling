@@ -1,0 +1,13 @@
+name: astrbot_plugin_github_ling
+display_name: Github 读写插件 - 灵
+desc: 绑定 GitHub 仓库，用卡片推送 Commit、PR 与 Issue 更新
+help: |
+  /ghbind 用户名/仓库名    绑定仓库到当前会话（也接受完整 GitHub 链接）
+  /ghunbind [仓库]         取消绑定，省略参数则取消当前会话全部绑定
+  /ghbindlist              查看当前会话绑定的仓库
+  /ghcheck                 立即检查一次更新（轮询模式下有效）
+  /ghrewind [分钟]         回退检查水位线，找回漏掉的更新
+  /ghstatus                查看运行模式、检查间隔、Token 与 API 连通性
+version: 1.4.7
+author: SlimeBoyOwO
+repo: https://github.com/SlimeBoyOwO/astrbot_plugin_github_ling

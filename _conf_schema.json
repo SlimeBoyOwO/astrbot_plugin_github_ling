@@ -1,0 +1,106 @@
+{
+  "github_token": {
+    "description": "GitHub API 访问令牌",
+    "type": "string",
+    "hint": "可选。填写后 API 限额从 60 次/小时提升到 5000 次/小时，并可访问私有仓库。格式如 ghp_xxxxxx",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "github_proxy": {
+    "description": "GitHub API 代理",
+    "type": "string",
+    "hint": "可选。服务器无法直连 api.github.com 时填写，例如 http://127.0.0.1:7890",
+    "default": ""
+  },
+  "github_ca_bundle": {
+    "description": "自定义 CA 证书文件",
+    "type": "string",
+    "hint": "可选。服务器报 CERTIFICATE_VERIFY_FAILED 时，填写代理/企业根证书 PEM 文件的绝对路径；留空则自动使用系统信任库 + certifi",
+    "default": ""
+  },
+  "github_ssl_verify": {
+    "description": "校验 GitHub API 的 TLS 证书",
+    "type": "bool",
+    "hint": "默认开启。仅在证书问题无法解决时临时关闭，关闭后存在中间人风险",
+    "default": true
+  },
+  "check_interval": {
+    "description": "轮询检查间隔（分钟）",
+    "type": "int",
+    "hint": "仅在轮询模式下生效。没有 Token 时建议不低于 10 分钟",
+    "default": 10
+  },
+  "send_card_image": {
+    "description": "使用卡片图片推送",
+    "type": "bool",
+    "hint": "开启后把通知渲染成图片卡片发送；渲染失败或关闭时自动退回纯文本",
+    "default": true
+  },
+  "card_style": {
+    "description": "卡片风格",
+    "type": "string",
+    "hint": "ling = 米白色毛玻璃卡片（插件内置渲染，无需联网，推荐）；markdown = 交给 AstrBot 文转图渲染 Markdown",
+    "options": ["ling", "markdown"],
+    "default": "ling"
+  },
+  "card_width": {
+    "description": "卡片宽度（像素）",
+    "type": "int",
+    "hint": "仅 card_style=ling 时生效，默认 960。宽度越大字号与内容按比例放大",
+    "default": 960
+  },
+  "comment_line_limit": {
+    "description": "评论展示行数",
+    "type": "int",
+    "hint": "PR / Issue 通知中最多展示评论的前多少行",
+    "default": 10
+  },
+  "max_commits_per_card": {
+    "description": "单张卡片最多展示的提交数",
+    "type": "int",
+    "hint": "一次推送包含多个提交时，超出的部分会折叠为“以及另外 N 个提交”",
+    "default": 5
+  },
+  "poll_comments": {
+    "description": "轮询时获取最新评论",
+    "type": "bool",
+    "hint": "开启后对每个有更新的 Issue/PR 额外请求一次最新评论（更贴近评论通知，但消耗 API 限额）",
+    "default": true
+  },
+  "max_items_per_check": {
+    "description": "单次检查最多拉取的评论数",
+    "type": "int",
+    "hint": "限制每轮轮询为多少个 Issue/PR 额外请求最新评论，保护 API 限额",
+    "default": 3
+  },
+  "enable_webhook": {
+    "description": "启用 Webhook 模式",
+    "type": "bool",
+    "hint": "开启后不再轮询，由 GitHub 主动推送事件，评论通知更及时",
+    "default": false
+  },
+  "webhook_host": {
+    "description": "Webhook 监听地址",
+    "type": "string",
+    "hint": "例如 0.0.0.0 或 127.0.0.1",
+    "default": "0.0.0.0"
+  },
+  "webhook_port": {
+    "description": "Webhook 监听端口",
+    "type": "int",
+    "hint": "需要对公网开放，供 GitHub 回调",
+    "default": 6193
+  },
+  "webhook_path": {
+    "description": "Webhook 回调路径",
+    "type": "string",
+    "hint": "需与 GitHub Webhook 配置中的 Path 一致，以 / 开头",
+    "default": "/github/webhook"
+  },
+  "webhook_secret": {
+    "description": "Webhook 校验密钥",
+    "type": "string",
+    "hint": "与 GitHub Webhook 设置中的 Secret 保持一致，用于校验 X-Hub-Signature-256",
+    "default": ""
+  }
+}
