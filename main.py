@@ -42,6 +42,19 @@ CARD_RENDER_TIMEOUT = 20
 # 推进水位线时回退几秒，避免 GitHub 秒级时间戳与查询快照之间的边界漏报
 WATERMARK_SAFETY_SECONDS = 2
 
+# 额外推送目标的简写前缀 → AstrBot 的消息类型
+# 会话标识（unified_msg_origin）格式为 platform_id:消息类型:会话ID
+TARGET_KIND_PREFIXES = {
+    "group": "GroupMessage",
+    "群": "GroupMessage",
+    "群聊": "GroupMessage",
+    "private": "FriendMessage",
+    "friend": "FriendMessage",
+    "私聊": "FriendMessage",
+    "好友": "FriendMessage",
+}
+MESSAGE_TYPES = {"GroupMessage", "FriendMessage", "OtherMessage"}
+
 
 def _looks_like_image(data: bytes) -> bool:
     """粗略判断字节串是不是 PNG / JPEG / GIF / WebP 图片。"""
@@ -103,7 +116,7 @@ def _describe_issue_event(event: dict[str, Any]) -> str | None:
     "astrbot_plugin_github_ling",
     "SlimeBoyOwO",
     "绑定 GitHub 仓库，用卡片推送 Commit、PR 与 Issue 更新",
-    "1.4.7",
+    "1.5.0",
 )
 class GitHubLingPlugin(Star):
     """GitHub 仓库消息推送
@@ -118,6 +131,7 @@ class GitHubLingPlugin(Star):
     /ghbind 用户名/仓库名 force  跳过 API 校验直接绑定（服务器连不上 api.github.com 时使用）
     /ghunbind [仓库]         取消绑定，省略参数则取消当前会话全部绑定
     /ghbindlist              查看当前会话绑定的仓库
+    /ghpush on|off|list      把当前会话（例如某个群）加入/移出额外推送目标
     /ghcheck                 立即检查一次更新（轮询模式）
     /ghrewind [分钟]         把水位线回退若干分钟，用于找回漏掉的事件
     /ghstatus                查看运行状态与 API 连通性
@@ -149,6 +163,7 @@ class GitHubLingPlugin(Star):
         self.max_items_per_check = self._cfg_int(
             "max_items_per_check", 3, minimum=1
         )
+        self.push_platform = str(self.config.get("push_platform", "") or "").strip()
 
         self.enable_webhook = self._cfg_bool("enable_webhook", False)
         self.webhook_host = str(self.config.get("webhook_host", "0.0.0.0"))
@@ -168,6 +183,12 @@ class GitHubLingPlugin(Star):
             str(repo): str(value)
             for repo, value in (state.get("watermarks") or {}).items()
         }
+        # 额外推送目标（群聊 / 私聊），与具体仓库无关，所有已绑定仓库的更新都会推送过去
+        self.broadcasts: list[str] = [
+            str(item).strip()
+            for item in (state.get("broadcasts") or [])
+            if str(item).strip()
+        ]
 
         self.api = GitHubAPI(
             self.github_token,
@@ -319,6 +340,7 @@ class GitHubLingPlugin(Star):
                     {
                         "bindings": self.bindings,
                         "watermarks": self.watermarks,
+                        "broadcasts": self.broadcasts,
                     },
                     file,
                     ensure_ascii=False,
@@ -358,6 +380,104 @@ class GitHubLingPlugin(Star):
             if key.lower() == lowered:
                 return key
         return None
+
+    # ------------------------------------------------------------------ 推送目标
+
+    def _platform_id_hint(self) -> str:
+        """推断简写目标应该用哪个平台适配器。"""
+        configured = str(self.config.get("push_platform", "") or "").strip()
+        if configured:
+            return configured
+
+        # 1) 已绑定会话里出现过的平台
+        for subscribers in self.bindings.values():
+            for umo in subscribers:
+                parts = str(umo).split(":", 2)
+                if len(parts) == 3 and parts[0]:
+                    return parts[0]
+
+        # 2) 当前已加载的平台适配器
+        try:
+            insts = self.context.platform_manager.platform_insts
+        except Exception:
+            insts = []
+        for inst in insts:
+            try:
+                platform_id = str(inst.meta().id or "")
+            except Exception:
+                continue
+            if platform_id:
+                return platform_id
+        return ""
+
+    def _normalize_target(self, raw: Any) -> str | None:
+        """把配置里的一条目标解析成 unified_msg_origin。
+
+        支持三种写法：
+
+        * 完整会话标识：``aiocqhttp:GroupMessage:123456789``
+        * 简写：``group:123456789`` / ``private:123456789``（也认「群/群聊/私聊」）
+        * 纯数字：``123456789``，按群聊处理
+
+        无法解析时返回 ``None``。
+        """
+        value = str(raw or "").strip().strip("\"'").strip()
+        if not value:
+            return None
+
+        if value.count(":") >= 2:
+            parts = value.split(":", 2)
+            if all(part.strip() for part in parts) and parts[1] in MESSAGE_TYPES:
+                return value
+            # 不是标准会话标识，继续按简写解析（例如 group:123 有两段）
+
+        head, _, rest = value.partition(":")
+        kind = TARGET_KIND_PREFIXES.get(head.strip().lower())
+        platform = self._platform_id_hint()
+        if kind:
+            rest = rest.strip()
+            if not rest or not platform:
+                return None
+            return f"{platform}:{kind}:{rest}"
+
+        if value.isdigit() and platform:
+            return f"{platform}:GroupMessage:{value}"
+        return None
+
+    def _configured_targets(self) -> list[str]:
+        """配置项 push_targets 里声明的额外目标。"""
+        raw = self.config.get("push_targets", [])
+        items: list[Any]
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, str):
+            items = [line for line in raw.replace(",", "\n").splitlines()]
+        else:
+            items = []
+
+        targets: list[str] = []
+        for item in items:
+            target = self._normalize_target(item)
+            if target and target not in targets:
+                targets.append(target)
+        return targets
+
+    def _broadcast_targets(self) -> list[str]:
+        """所有额外目标：/ghpush 添加的 + 配置里写的。"""
+        targets: list[str] = []
+        for item in [*self.broadcasts, *self._configured_targets()]:
+            target = self._normalize_target(item) or item
+            if target and target not in targets:
+                targets.append(target)
+        return targets
+
+    def _delivery_targets(self, subscribers: list[str]) -> list[str]:
+        """本次推送的实际接收者：绑定会话 + 额外目标（去重，保持顺序）。"""
+        targets: list[str] = []
+        for item in [*subscribers, *self._broadcast_targets()]:
+            if item and item not in targets:
+                targets.append(item)
+        return targets
 
     # ------------------------------------------------------------------ 命令
 
@@ -489,6 +609,58 @@ class GitHubLingPlugin(Star):
             "当前会话绑定的仓库：\n" + "\n".join(f"- {repo}" for repo in repos)
         )
 
+    @filter.command("ghpush", alias={"gh推送"})
+    async def manage_push_targets(
+        self,
+        event: AstrMessageEvent,
+        action: str | None = None,
+    ):
+        """把当前会话加入额外推送目标。用法: /ghpush on|off|list"""
+        value = str(action or "").strip().lower()
+        umo = event.unified_msg_origin
+
+        if value in {"on", "add", "开", "开启", "加入", "enable", "yes"}:
+            if umo in self.broadcasts:
+                yield event.plain_result("当前会话已经在推送列表里了")
+                return
+            self.broadcasts.append(umo)
+            self._save_state()
+            lines = ["✅ 已把当前会话加入推送列表"]
+            if self.bindings:
+                lines.append(
+                    f"之后 {len(self.bindings)} 个已绑定仓库的更新都会推送到这里。"
+                )
+            else:
+                lines.append(
+                    "⚠️ 目前还没有绑定任何仓库，请先发送 /ghbind 用户名/仓库名"
+                )
+            lines.append("取消：/ghpush off")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if value in {"off", "del", "remove", "关", "关闭", "取消", "退出", "disable"}:
+            if umo not in self.broadcasts:
+                yield event.plain_result("当前会话不在推送列表里")
+                return
+            self.broadcasts.remove(umo)
+            self._save_state()
+            yield event.plain_result("已把当前会话移出推送列表")
+            return
+
+        lines = ["📢 额外推送目标（所有已绑定仓库的更新都会推到这里）"]
+        if self.broadcasts:
+            lines.extend(f"- {item}（/ghpush 添加）" for item in self.broadcasts)
+        if self._configured_targets():
+            lines.extend(
+                f"- {item}（配置项 push_targets）"
+                for item in self._configured_targets()
+            )
+        if not self.broadcasts and not self._configured_targets():
+            lines.append("- （暂无）")
+            lines.append("在群里发送 /ghpush on，本群就会开始接收推送")
+        lines.append(f"当前会话：{umo}")
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("ghcheck")
     async def check_now(self, event: AstrMessageEvent):
         """立即检查一次更新（轮询模式）"""
@@ -565,6 +737,7 @@ class GitHubLingPlugin(Star):
             f"代理：{self.github_proxy or '未配置'}",
             f"TLS：{'自定义 CA' if self.github_ca_bundle else ('校验开启' if self.github_ssl_verify else '校验已关闭（不安全）')}",
             f"已绑定仓库：{len(self.bindings)} 个",
+            f"额外推送目标：{len(self._broadcast_targets())} 个",
             f"卡片图片：{'开启' if self.send_card_image else '关闭'}"
             f"（{self.card_style}）",
         ]
@@ -920,6 +1093,7 @@ class GitHubLingPlugin(Star):
     async def _deliver(
         self, event: dict[str, Any], subscribers: list[str]
     ) -> None:
+        subscribers = self._delivery_targets(subscribers)
         if not subscribers:
             return
 

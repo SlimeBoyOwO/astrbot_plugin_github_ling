@@ -24,11 +24,45 @@
 | `/ghbind 用户名/仓库名 force` | 跳过 API 校验直接绑定；服务器连不上 `api.github.com` 时配合 Webhook 模式使用 |
 | `/ghunbind [用户名/仓库名]` | 取消绑定；省略参数则取消当前会话的全部绑定 |
 | `/ghbindlist` | 查看当前会话绑定的仓库 |
+| `/ghpush on` / `off` / `list` | 把**当前会话**（通常是某个群）加入/移出额外推送目标，查看全部目标 |
 | `/ghcheck` | 立即检查一次更新（轮询模式） |
 | `/ghrewind [分钟]` | 把当前会话的水位线回退 N 分钟（默认 10），找回漏掉的更新 |
 | `/ghstatus` | 查看运行模式、间隔、Token、代理、API 连通性与剩余额度 |
 
 绑定后，该会话会收到仓库的 Commit、PR、Issue 更新推送。
+
+## 推送到指定群聊
+
+默认情况下，更新只推送给**执行 `/ghbind` 的那个会话**：在私聊里绑定，就只有私聊收到。
+想让某个群也收到，两种办法。
+
+**方式一：直接在群里发命令（推荐）**
+
+```
+/ghpush on      # 让本群也接收推送（所有已绑定仓库的更新都会推到这里）
+/ghpush off     # 取消
+/ghpush list    # 查看当前所有推送目标
+```
+
+**方式二：在插件配置里填 `push_targets`**
+
+每项支持三种写法：
+
+| 写法 | 说明 |
+| --- | --- |
+| `aiocqhttp:GroupMessage:123456789` | 完整会话标识（`unified_msg_origin`），任何平台都适用 |
+| `group:123456789` / `private:123456789` | 简写，也认 `群:`、`群聊:`、`私聊:` |
+| `123456789` | 纯数字，按群聊处理 |
+
+简写需要知道平台 ID（如 `aiocqhttp`、`telegram`），可填在 `push_platform`；
+留空时插件先取已绑定会话的平台，再退到第一个已加载的平台适配器。
+
+几点约定：
+
+- 额外目标是**全局的**：收到的是所有已绑定仓库的更新，不区分仓库；
+- 至少要在某个会话里 `/ghbind` 过，否则插件不会去检查任何仓库；
+- 和已绑定的会话重复时自动去重，不会推两遍；
+- 目标失效（退群、封号）只会在日志里报错，不影响其他会话的推送。
 
 ## 配置
 
@@ -46,6 +80,8 @@
 | `max_commits_per_card` | `5` | 单张提交卡片最多展示的提交数 |
 | `poll_comments` | `true` | 轮询时为有更新的 Issue/PR 额外请求一条最新评论 |
 | `max_items_per_check` | `3` | 单轮最多为多少个 Issue/PR 拉取最新评论（保护 API 限额） |
+| `push_targets` | 空 | 额外推送目标（群聊 / 私聊），详见下文「推送到指定群聊」 |
+| `push_platform` | 空 | `push_targets` 用简写时所属的平台 ID，例如 `aiocqhttp`；留空自动推断 |
 | `enable_webhook` | `false` | 开启后停止轮询，改由 GitHub 主动推送 |
 | `webhook_host` / `webhook_port` / `webhook_path` | `0.0.0.0` / `6193` / `/github/webhook` | Webhook 监听参数 |
 | `webhook_secret` | 空 | 用于校验 `X-Hub-Signature-256`，强烈建议设置 |
@@ -172,7 +208,8 @@ python tools/preview_cards.py --render --render-markdown
   },
   "watermarks": {
     "owner/repo": "2026-11-06T01:23:45Z"
-  }
+  },
+  "broadcasts": ["aiocqhttp:GroupMessage:987654321"]
 }
 ```
 

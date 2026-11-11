@@ -73,6 +73,18 @@
     "hint": "限制每轮轮询为多少个 Issue/PR 额外请求最新评论，保护 API 限额",
     "default": 3
   },
+  "push_targets": {
+    "description": "额外推送目标（群聊 / 私聊）",
+    "type": "list",
+    "hint": "默认只推送给执行 /ghbind 的会话。这里可以额外指定会话，它们会收到所有已绑定仓库的更新。每项填法：\n1. 完整会话标识 aiocqhttp:GroupMessage:123456789\n2. 简写 group:123456789 / private:123456789（群 / 私聊）\n3. 纯数字 123456789（按群聊处理）\n简写会用 push_platform 指定的平台，留空则自动推断。也可以直接在目标群里发送 /ghpush on。",
+    "default": []
+  },
+  "push_platform": {
+    "description": "推送目标使用的平台 ID",
+    "type": "string",
+    "hint": "仅当 push_targets 使用简写（group:123 / 纯数字）时需要，例如 aiocqhttp、telegram。留空则自动使用已绑定会话的平台或第一个已加载的适配器",
+    "default": ""
+  },
   "enable_webhook": {
     "description": "启用 Webhook 模式",
     "type": "bool",
