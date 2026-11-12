@@ -10,9 +10,10 @@ help: |
   /ghissue [说明]          引用一条消息（日志 / 合并转发 / 截图）自动生成 Issue
   /ghissue ok|cancel       确认或放弃草稿
   /ghissue tpl 序号|list   换模板重新生成 / 查看模板
+  /ghcomment 编号 [内容]   在已有 Issue / PR 下发表评论（可附带引用内容）
   /ghcheck                 立即检查一次更新（轮询模式下有效）
   /ghrewind [分钟]         回退检查水位线，找回漏掉的更新
   /ghstatus                查看运行模式、检查间隔、Token 与 API 连通性
-version: 1.6.3
+version: 1.6.4
 author: SlimeBoyOwO
 repo: https://github.com/SlimeBoyOwO/astrbot_plugin_github_ling

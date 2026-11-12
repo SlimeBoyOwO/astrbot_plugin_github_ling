@@ -491,6 +491,21 @@ class GitHubAPI:
         )
         return data if isinstance(data, dict) and data.get("number") else None
 
+    async def create_comment(
+        self,
+        repo: str,
+        number: int,
+        body: str,
+    ) -> dict[str, Any] | None:
+        """在 Issue / PR 下发表评论，成功返回评论数据（含 html_url）。"""
+        data = await self._request(
+            "POST",
+            f"/repos/{repo}/issues/{number}/comments",
+            body={"body": body},
+            timeout=30,
+        )
+        return data if isinstance(data, dict) and data.get("id") else None
+
     # ------------------------------------------------------------------ Git Data
     # 用来把聊天截图提交到独立分支，从而在 Issue 里以图片形式展示。
 

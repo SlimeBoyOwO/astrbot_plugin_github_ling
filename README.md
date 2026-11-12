@@ -31,6 +31,7 @@
 | `/ghissue [说明]` | 引用一条消息后发送，由大模型生成 Issue 草稿（详见下文） |
 | `/ghissue ok` / `cancel` | 确认创建 / 放弃草稿 |
 | `/ghissue tpl 序号` / `list` | 换模板重新生成 / 查看仓库的 Issue 模板 |
+| `/ghcomment 编号 [内容]` | 在已有 Issue / PR 下发表评论，支持完整链接、`owner/repo#编号`、引用消息 |
 | `/ghcheck` | 立即检查一次更新（轮询模式） |
 | `/ghrewind [分钟]` | 把当前会话的水位线回退 N 分钟（默认 10），找回漏掉的更新 |
 | `/ghstatus` | 查看运行模式、间隔、Token、代理、API 连通性与剩余额度 |
@@ -173,6 +174,23 @@ GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”�
 使用 AstrBot 当前会话的默认对话模型；也可以在 `issue_llm_provider` 里指定一个提供商 ID。
 模型需要能按要求输出 JSON；要读懂截图还需要模型支持图片输入——不支持时会自动退回纯文本重试，
 正文里会缺截图中的信息。
+
+## 给已有 Issue 留言
+
+不经过大模型，直接把一段文字（或引用的聊天记录）发到已有 Issue / PR 下：
+
+```
+/ghcomment 12 已在 v1.6.3 修复
+/ghcomment https://github.com/owner/repo/issues/12 补充一下环境
+/ghcomment owner/repo#12 补充一下环境
+/ghcomment -r owner/repo 12 补充一下环境
+```
+
+- 只写编号时使用本会话的默认仓库（与 `/ghissue` 一致）；
+- 只写编号、不写内容，但**引用了一条消息**时，引用内容会以 Markdown 引用块附在评论末尾；
+- 评论内容和引用内容都为空时不会提交；
+- 遵循 `issue_admin_only` 的权限规则；
+- 评论会如常触发插件自己的更新推送，方便确认是否真的发到了 GitHub。
 
 ## 配置
 

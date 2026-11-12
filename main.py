@@ -46,7 +46,7 @@ from .github.poller import Poller, server_now_iso
 from .github.webhook import GitHubWebhookServer
 from .issue.agent import IssueAgent
 from .issue.assets import AssetUploader
-from .issue.context import ChatContextCollector
+from .issue.context import ChatContextCollector, extract_quoted_message_text
 from .issue.draft import DraftStore, format_preview, preview_sections
 from .issue.templates import TemplateCatalog
 from .render import card as card_render
@@ -62,7 +62,7 @@ try:  # 全局管理员列表
 except Exception:  # pragma: no cover
     astrbot_config = None  # type: ignore[assignment]
 
-PLUGIN_VERSION = "1.6.3"
+PLUGIN_VERSION = "1.6.4"
 
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
@@ -74,6 +74,22 @@ ADMIN_CACHE_TTL = 300
 
 REPO_PATTERN = re.compile(r"^[\w.-]+/[\w.-]+$")
 REPO_IN_TEXT_PATTERN = re.compile(r"github\.com/([\w.-]+)/([\w.-]+)")
+
+# /ghcomment 的目标写法：完整链接、owner/repo#12、#12 或 12
+COMMENT_URL_PATTERN = re.compile(
+    r"github\.com/([\w.-]+)/([\w.-]+)/(?:issues|pull)/(\d+)", re.IGNORECASE
+)
+COMMENT_SHORT_PATTERN = re.compile(r"^(?P<repo>[\w.-]+/[\w.-]+)#(?P<number>\d+)$")
+COMMENT_NUMBER_PATTERN = re.compile(r"^#?(\d+)$")
+
+COMMENT_USAGE = (
+    "用法：/ghcomment 编号 [评论内容]\n"
+    "也可以写完整链接或 owner/repo#编号：\n"
+    "  /ghcomment https://github.com/owner/repo/issues/12 已修复\n"
+    "  /ghcomment owner/repo#12 已修复\n"
+    "只写编号时，会使用本会话（或你绑定的）默认仓库。\n"
+    "引用一条消息再发送，可以把引用内容作为引用块附在评论末尾。"
+)
 
 # 文转图服务默认会先请求网络端点，网络不佳时可能长时间阻塞；
 # 超过该时间即放弃卡片、改用纯文本，避免阻塞后续通知。
@@ -134,6 +150,7 @@ class GitHubLingPlugin(Star):
     /ghswitch [仓库]         切换当前会话默认使用的仓库（/ghissue 用它）
     /ghpush on|off|list      把当前会话（例如某个群）加入/移出额外推送目标
     /ghissue [说明|ok|cancel|tpl N|list]  根据引用的聊天记录自动发 Issue
+    /ghcomment 编号 [内容]   在已有 Issue / PR 下发表评论（可附带引用内容）
     /ghcheck                 立即检查一次更新（轮询模式）
     /ghrewind [分钟]         把水位线回退若干分钟，用于找回漏掉的事件
     /ghstatus                查看运行状态与 API 连通性
@@ -433,6 +450,30 @@ class GitHubLingPlugin(Star):
     async def _is_admin(self, event: AstrMessageEvent) -> bool:
         allowed, _ = await self._admin_check(event)
         return allowed
+
+    async def _permission_error(
+        self, event: AstrMessageEvent, *, action_name: str = "自动发 Issue"
+    ) -> str | None:
+        """返回无权限时给用户的提示，有权限时返回 None。"""
+        if not self.cfg.issue_admin_only:
+            return None
+        allowed, _ = await self._admin_check(event)
+        if allowed:
+            return None
+        sender = self._user_id(event)
+        admins = "、".join(sorted(self._admin_ids())) or "（空）"
+        return (
+            f"{action_name}需要管理员权限。\n"
+            f"你的用户 ID：{sender or '未知'}\n"
+            f"当前 issue_admin_users：{admins}\n"
+            "以下任一种方式都可以获得权限：\n"
+            "1. 群主 / 群管理员直接使用（插件会自动识别）；\n"
+            "2. 在插件配置 issue_admin_users 里加上你的 QQ 号（私聊也有效）；\n"
+            "3. 把账号加入 AstrBot 的 admins_id（管理员 ID）；\n"
+            "4. 关闭 issue_admin_only 让所有人使用。\n"
+            f"配置文件：{self.config_path or '未获取到路径'}\n"
+            "发送 /ghstatus 可以查看插件读取到的配置路径与权限判定结果。"
+        )
 
     async def _admin_check(self, event: AstrMessageEvent) -> tuple[bool, str]:
         """判断发送者能否使用 /ghissue，并返回依据（方便 /ghstatus 排查）。"""
@@ -992,6 +1033,62 @@ class GitHubLingPlugin(Star):
 
         yield event.plain_result("\n".join(lines))
 
+    # ------------------------------------------------------------------ 命令：评论
+
+    @filter.command("ghcomment", alias={"gh评论", "ghc"})
+    async def comment_command(self, event: AstrMessageEvent, action: GreedyStr):
+        """在已有的 Issue / PR 下发表评论。
+
+        用法：
+        /ghcomment 12 评论内容
+        /ghcomment https://github.com/owner/repo/issues/12 评论内容
+        /ghcomment owner/repo#12 评论内容
+        /ghcomment 12            （引用一条消息，把引用内容作为引用块附上）
+        """
+        self._sync_config()
+        error = await self._permission_error(event, action_name="发表评论")
+        if error:
+            yield event.plain_result(error)
+            return
+
+        repo_arg, number, text, parse_error = self._parse_comment_args(
+            str(action or "")
+        )
+        if parse_error:
+            yield event.plain_result(parse_error)
+            return
+
+        repo, repo_error, _ = self._issue_repo(event, repo_arg)
+        if not repo:
+            yield event.plain_result(repo_error)
+            return
+
+        body = await self._compose_comment(event, text)
+        if not body:
+            yield event.plain_result(
+                "评论内容是空的。\n" + COMMENT_USAGE
+            )
+            return
+
+        data = await self.api.create_comment(repo, number, body)
+        if not data:
+            status = self.api.last_status
+            reason = self.api.last_error or "未知原因"
+            if status == 404:
+                reason = (
+                    f"{repo} 里没有 #{number}，或者 Token 没有访问该仓库的权限"
+                )
+            elif status == 403:
+                reason = "没有评论权限，或该 Issue 已锁定（" + reason + "）"
+            yield event.plain_result(f"评论失败：{reason}")
+            return
+
+        url = str(data.get("html_url") or "")
+        if url:
+            yield event.plain_result(f"已发表评论：{url}")
+        else:
+            yield event.plain_result(f"已发表评论到 {repo} #{number}")
+
     # ------------------------------------------------------------------ 命令：自动发 Issue
 
     @filter.command("ghissue", alias={"gh发issue", "ghnew"})
@@ -1012,25 +1109,10 @@ class GitHubLingPlugin(Star):
                 "自动发 Issue 已在插件配置中关闭（issue_enabled）"
             )
             return
-        if self.cfg.issue_admin_only:
-            allowed, reason = await self._admin_check(event)
-            if not allowed:
-                sender = self._user_id(event)
-                admins = "、".join(sorted(self._admin_ids())) or "（空）"
-                yield event.plain_result(
-                    "自动发 Issue 需要管理员权限。\n"
-                    f"你的用户 ID：{sender or '未知'}\n"
-                    f"当前 issue_admin_users：{admins}\n"
-                    "以下任一种方式都可以获得权限：\n"
-                    "1. 群主 / 群管理员直接使用（插件会自动识别）；\n"
-                    "2. 在插件配置 issue_admin_users 里加上你的 QQ 号"
-                    "（私聊也有效）；\n"
-                    "3. 把账号加入 AstrBot 的 admins_id（管理员 ID）；\n"
-                    "4. 关闭 issue_admin_only 让所有人使用。\n"
-                    f"配置文件：{self.config_path or '未获取到路径'}\n"
-                    "发送 /ghstatus 可以查看插件读取到的配置路径与权限判定结果。"
-                )
-                return
+        error = await self._permission_error(event, action_name="自动发 Issue")
+        if error:
+            yield event.plain_result(error)
+            return
 
         raw = str(action or "").strip()
         tokens = raw.split()
@@ -1228,6 +1310,81 @@ class GitHubLingPlugin(Star):
         return prefix + "\n".join(lines)
 
     # ------------------------------------------------------------------ Issue 参数
+
+    def _parse_comment_args(
+        self, raw: str
+    ) -> tuple[str | None, int | None, str, str]:
+        """解析 ``/ghcomment``：返回 ``(仓库, 编号, 评论内容, 错误)``。"""
+        tokens = raw.split()
+        repo_arg: str | None = None
+        position = 0
+        while position < len(tokens):
+            if tokens[position] in {"-r", "--repo"}:
+                if position + 1 >= len(tokens):
+                    return (
+                        None,
+                        None,
+                        "",
+                        "参数 -r 后面需要写仓库名，例如 -r owner/repo",
+                    )
+                repo_arg = tokens[position + 1]
+                position += 2
+                continue
+            break
+
+        if position >= len(tokens):
+            return None, None, "", COMMENT_USAGE
+
+        target = tokens[position]
+        position += 1
+        target_repo: str | None = None
+        number: int | None = None
+
+        match = COMMENT_URL_PATTERN.search(target)
+        if match:
+            target_repo = f"{match.group(1)}/{match.group(2)}"
+            number = int(match.group(3))
+        else:
+            short = COMMENT_SHORT_PATTERN.match(target)
+            if short:
+                target_repo = short.group("repo")
+                number = int(short.group("number"))
+            else:
+                plain_number = COMMENT_NUMBER_PATTERN.match(target)
+                if plain_number:
+                    number = int(plain_number.group(1))
+
+        if number is None or number <= 0:
+            return None, None, "", "没有看懂要评论哪个 Issue。\n" + COMMENT_USAGE
+
+        body = " ".join(tokens[position:]).strip()
+        return repo_arg or target_repo, number, body, ""
+
+    async def _compose_comment(self, event: AstrMessageEvent, text: str) -> str:
+        """评论正文：用户写的文字 + 引用消息（Markdown 引用块）。"""
+        parts: list[str] = []
+        instruction = (text or "").strip()
+        if instruction:
+            parts.append(instruction)
+
+        quoted = ""
+        if extract_quoted_message_text is not None:
+            try:
+                quoted = str(await extract_quoted_message_text(event) or "")
+            except Exception as exc:
+                logger.debug("解析引用消息失败: %s", exc)
+                quoted = ""
+        quoted = quoted.strip()
+        if quoted:
+            limit = self.cfg.issue_max_context_chars
+            if len(quoted) > limit:
+                quoted = quoted[:limit] + "\n…（内容过长，已截断）"
+            lines = ["> 【引用的消息】"]
+            for line in quoted.splitlines():
+                lines.append(f"> {line}" if line.strip() else ">")
+            parts.append("\n".join(lines))
+
+        return "\n\n".join(parts).strip()
 
     def _parse_issue_args(
         self, raw: str
