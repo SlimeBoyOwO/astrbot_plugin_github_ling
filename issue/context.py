@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -79,6 +80,21 @@ def _is_image_ref(value: Any) -> bool:
         return os.path.exists(text)
     except OSError:
         return False
+
+
+def _file_uri_to_path(value: str) -> str:
+    path = unquote(urlparse(value).path)
+    if os.name == "nt" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+        path = path[1:]
+    return path
+
+
+def _normalize_image_ref(value: str) -> str:
+    """把 file:// 换成普通路径，模型与上传逻辑都更容易处理。"""
+    text = str(value or "").strip()
+    if text.lower().startswith("file://"):
+        return _file_uri_to_path(text)
+    return text
 
 
 def _dedupe(items: list[str]) -> list[str]:
@@ -180,7 +196,13 @@ class ChatContextCollector:
             text = text[: self.max_chars] + "\n…（内容过长，已截断）"
             truncated = True
 
-        unique_images = _dedupe([item for item in images if _is_image_ref(item)])
+        unique_images = _dedupe(
+            [
+                _normalize_image_ref(item)
+                for item in images
+                if _is_image_ref(item)
+            ]
+        )
         image_limit_hit = len(unique_images) > self.max_images
         if self.max_images:
             unique_images = unique_images[: self.max_images]
