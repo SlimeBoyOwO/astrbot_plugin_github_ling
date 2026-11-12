@@ -39,6 +39,7 @@ from .core import targets
 from .core.config import PluginConfig
 from .core.paths import AVATAR_DIR
 from .core.state import StateStore
+from .core.texts import strip_placeholders
 from .core.timeutil import now_iso, parse_time
 from .github import events as webhook_events
 from .github.client import GitHubAPI
@@ -66,7 +67,7 @@ try:  # 全局管理员列表
 except Exception:  # pragma: no cover
     astrbot_config = None  # type: ignore[assignment]
 
-PLUGIN_VERSION = "1.6.8"
+PLUGIN_VERSION = "1.6.9"
 
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
@@ -1088,10 +1089,8 @@ class GitHubLingPlugin(Star):
             yield event.plain_result(f"正在上传 {len(images)} 张截图…")
             result = await self.assets.upload(repo, images)
             if result.urls:
-                lines = ["### 截图", ""]
-                for index, url in enumerate(result.urls, start=1):
-                    lines.append(f"![截图 {index}]({url})")
-                body = (body + "\n\n" if body else "") + "\n".join(lines)
+                shots = "\n\n".join(f"![]({url})" for url in result.urls)
+                body = (body + "\n\n" if body else "") + shots
             if result.note:
                 if not result.urls and not body:
                     yield event.plain_result(f"评论没有发出：{result.note}")
@@ -1402,7 +1401,7 @@ class GitHubLingPlugin(Star):
             except Exception as exc:
                 logger.debug("解析引用消息失败: %s", exc)
                 quoted = ""
-        quoted = quoted.strip()
+        quoted = strip_placeholders(quoted.strip())
         if quoted:
             limit = self.cfg.issue_max_context_chars
             if len(quoted) > limit:

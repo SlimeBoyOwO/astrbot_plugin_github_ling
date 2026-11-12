@@ -24,7 +24,12 @@ from urllib.parse import unquote, urlparse
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 
-from ..core.texts import normalize_spaces, squeeze_blank_lines, strip_control
+from ..core.texts import (
+    normalize_spaces,
+    squeeze_blank_lines,
+    strip_control,
+    strip_placeholders,
+)
 
 try:  # AstrBot >= 4.2x
     from astrbot.core.utils.quoted_message import (
@@ -231,7 +236,9 @@ class ChatContextCollector:
             texts.append(f"{prefix}\n{own_text}")
 
         # 3) 合并、清洗、截断
-        text = squeeze_blank_lines(strip_control("\n\n".join(texts)))
+        text = squeeze_blank_lines(
+            strip_placeholders(strip_control("\n\n".join(texts)))
+        )
         truncated = False
         if len(text) > self.max_chars:
             text = text[: self.max_chars] + "\n…（内容过长，已截断）"
@@ -335,7 +342,7 @@ class ChatContextCollector:
                         if item.text:
                             parts.append(item.text)
                     elif isinstance(item, Comp.Image):
-                        parts.append("[图片]")
+                        # 图片会单独上传，正文里不再留 [图片] 占位符
                         for candidate in (item.url, item.file, item.path):
                             if _is_image_ref(candidate):
                                 images.append(str(candidate).strip())

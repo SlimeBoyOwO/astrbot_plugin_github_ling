@@ -365,16 +365,15 @@ class IssueAgent:
         if draft.images:
             result = await self.uploader.upload(draft.repo, draft.images)
             if result.urls:
-                lines = ["", "", "---", "### 截图"]
-                for index, url in enumerate(result.urls, start=1):
-                    lines.append(f"![截图 {index}]({url})")
-                body += "\n".join(lines)
+                shots = "\n\n".join(f"![]({url})" for url in result.urls)
+                body += f"\n\n{shots}"
             if result.note:
                 note_parts.append(result.note)
 
         if note_parts:
             body += "\n\n> " + "；".join(note_parts)
 
+        body = body.strip()
         issue = await self.api.create_issue(
             repo=draft.repo,
             title=draft.title,

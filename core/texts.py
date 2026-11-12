@@ -10,6 +10,13 @@ import re
 _WHITESPACE_RE = re.compile(r"[ \t　]+")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+# QQ / OneBot 把非文字元素渲染成占位符，写进 Issue 正文只是噪音
+_PLACEHOLDER_RE = re.compile(
+    r"\[\s*(?:表情|动画表情|表情包|图片|语音|视频|文件|位置|链接|红包|小程序|卡片)\s*\]"
+    r"|\[CQ:[^\]]*\]",
+    re.IGNORECASE,
+)
+
 
 def short_sha(sha: str | None) -> str:
     """提交哈希的短形式。"""
@@ -85,6 +92,24 @@ def normalize_spaces(text: str | None) -> str:
 def strip_control(text: str | None) -> str:
     """去掉控制字符：QQ 消息里偶尔夹带，会让卡片 / JSON 出问题。"""
     return _CONTROL_RE.sub("", str(text or ""))
+
+
+def strip_placeholders(text: str | None) -> str:
+    """去掉 ``[表情]`` / ``[图片]`` / ``[CQ:...]`` 这类元素占位符。
+
+    图片本身会作为附件单独上传，表情也不值得留在 Issue 正文里；
+    占位符被删掉后再收一下多余的空格与空行。
+    """
+    lines: list[str] = []
+    for line in str(text or "").replace("\r\n", "\n").split("\n"):
+        if _PLACEHOLDER_RE.search(line):
+            # 只清理含占位符的行，避免把日志里的缩进一起吃掉
+            line = _PLACEHOLDER_RE.sub(" ", line)
+            line = _WHITESPACE_RE.sub(" ", line).strip()
+        lines.append(line)
+    value = "\n".join(lines)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip("\n")
 
 
 def truncate(text: str | None, limit: int, suffix: str = "…") -> tuple[str, bool]:
