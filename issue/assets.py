@@ -155,9 +155,12 @@ class AssetUploader:
                 urls=[],
                 failed=len(images),
                 note=(
-                    f"截图上传失败：Token 对 {target_repo} 没有写权限。"
-                    "请给 Token 勾选 Contents: Read and write（fine-grained）"
-                    "或 repo（classic），否则无法把截图提交到仓库"
+                    f"截图上传失败：Token 所属账号对 {target_repo} 没有写入权限。"
+                    "classic Token 需要 repo / public_repo 范围，"
+                    "并且该账号必须是仓库的协作者（Write 权限）；"
+                    "fine-grained Token 需要 Contents: Read and write。"
+                    "也可以把 issue_asset_repo 指向一个该账号有写权限的仓库，"
+                    "或把 issue_asset_mode 设为 none"
                 ),
             )
 
@@ -214,7 +217,10 @@ class AssetUploader:
                 note = f"截图上传失败：{stage_error or '目标仓库没有写入权限'}"
                 if self.api.last_status in {401, 403, 404}:
                     note += (
-                        "（请确认 Token 对该仓库有 Contents: Read and write 权限）"
+                        "（GitHub 对无写权限的仓库可能返回 404/403："
+                        "请确认 Token 所属账号已被加为该仓库的协作者，"
+                        "classic Token 勾选 repo 或 public_repo，"
+                        "fine-grained Token 勾选 Contents: Read and write）"
                     )
                 return UploadResult(urls=[], failed=len(images), note=note)
 

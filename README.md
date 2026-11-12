@@ -147,8 +147,12 @@ GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”�
 把图片作为 blob 提交到目标仓库的一个**专门分支**（默认 `ling-assets`，按 `issue-assets/年月/`
 分目录，文件名是内容哈希，重复图片不会重复提交），再把 `raw.githubusercontent.com` 链接放进正文。
 
-- 需要 Token 对目标仓库有 **Contents: Read and write**（classic Token 勾选 `repo` 或 `public_repo`）；
-  没有时 Issue 仍会创建，只是正文里注明“截图上传失败”，并提示缺少哪项权限；
+- 需要 Token **所属账号对目标仓库有写权限**：classic Token 勾选 `repo` / `public_repo`，
+  并且该账号必须是仓库的协作者（Write）；fine-grained Token 勾选 `Contents: Read and write`。
+  仅有 `repo` 范围但账号不是协作者时，公开仓库仍能创建 Issue，却无法提交截图
+  （GitHub 对这类写操作通常返回 404/403）；
+- 没有写权限时 Issue 仍会创建，正文里会注明“截图上传失败”并说明原因；
+  也可以把 `issue_asset_repo` 指向一个 Token 账号有写权限的仓库（例如自己的图床仓库）；
 - 截图分支不存在时会创建一个**只含图片的根提交**，不会复制默认分支的整棵文件树；
   已有分支则沿用原来的树，只追加新图片；
 - 图片下载失败时会再交给 AstrBot 的媒体缓存重试一次（更兼容 QQ 图床的临时链接与 UA 限制）；
