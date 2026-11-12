@@ -46,7 +46,11 @@ from .github.poller import Poller, server_now_iso
 from .github.webhook import GitHubWebhookServer
 from .issue.agent import IssueAgent
 from .issue.assets import AssetUploader
-from .issue.context import ChatContextCollector, extract_quoted_message_text
+from .issue.context import (
+    ChatContextCollector,
+    collect_comment_images,
+    extract_quoted_message_text,
+)
 from .issue.draft import DraftStore, format_preview, preview_sections
 from .issue.templates import TemplateCatalog
 from .render import card as card_render
@@ -62,7 +66,7 @@ try:  # 全局管理员列表
 except Exception:  # pragma: no cover
     astrbot_config = None  # type: ignore[assignment]
 
-PLUGIN_VERSION = "1.6.5"
+PLUGIN_VERSION = "1.6.6"
 
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
@@ -1044,6 +1048,7 @@ class GitHubLingPlugin(Star):
         /ghcomment https://github.com/owner/repo/issues/12 评论内容
         /ghcomment owner/repo#12 评论内容
         /ghcomment 12            （引用一条消息，把引用内容作为引用块附上）
+        引用消息里的截图会一起上传，以图片形式附在评论末尾。
         """
         self._sync_config()
         error = await self._permission_error(event, action_name="发表评论")
@@ -1064,11 +1069,24 @@ class GitHubLingPlugin(Star):
             return
 
         body = await self._compose_comment(event, text)
-        if not body:
-            yield event.plain_result(
-                "评论内容是空的。\n" + COMMENT_USAGE
-            )
+        images = await collect_comment_images(event, self.cfg.issue_max_images)
+        if not body and not images:
+            yield event.plain_result("评论内容是空的。\n" + COMMENT_USAGE)
             return
+
+        if images:
+            yield event.plain_result(f"正在上传 {len(images)} 张截图…")
+            result = await self.assets.upload(repo, images)
+            if result.urls:
+                lines = ["### 截图", ""]
+                for index, url in enumerate(result.urls, start=1):
+                    lines.append(f"![截图 {index}]({url})")
+                body = (body + "\n\n" if body else "") + "\n".join(lines)
+            if result.note:
+                if not result.urls and not body:
+                    yield event.plain_result(f"评论没有发出：{result.note}")
+                    return
+                body = (body + "\n\n" if body else "") + f"> {result.note}"
 
         data = await self.api.create_comment(repo, number, body)
         if not data:

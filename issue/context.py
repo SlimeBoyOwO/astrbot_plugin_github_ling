@@ -108,6 +108,47 @@ def _dedupe(items: list[str]) -> list[str]:
     return result
 
 
+async def collect_comment_images(event: Any, max_images: int = 4) -> list[str]:
+    """只收集图片：引用消息、当前消息里的图片与合并转发中的图片。
+
+    评论不需要整理成 Issue 正文，所以不走完整的长文本收集，只提取图片引用。
+    """
+    images: list[str] = []
+
+    if extract_quoted_message_images is not None and max_images:
+        try:
+            images.extend(await extract_quoted_message_images(event) or [])
+        except Exception as exc:
+            logger.debug("解析引用消息中的图片失败: %s", exc)
+
+    collector = ChatContextCollector(max_chars=500, max_images=max_images)
+    for comp in list(event.get_messages() or []):
+        if isinstance(comp, Comp.Image):
+            ref = await collector._component_image_ref(comp)
+            if ref:
+                images.append(ref)
+        elif isinstance(comp, Comp.Forward):
+            _, forward_images = await collector._read_forward(event, comp)
+            images.extend(forward_images)
+        elif isinstance(comp, Comp.Nodes):
+            _, node_images = collector._read_nodes(comp.nodes)
+            images.extend(node_images)
+        elif isinstance(comp, Comp.Node):
+            _, node_images = collector._read_nodes([comp])
+            images.extend(node_images)
+
+    unique = _dedupe(
+        [
+            _normalize_image_ref(item)
+            for item in images
+            if _is_image_ref(item)
+        ]
+    )
+    if max_images:
+        return unique[:max_images]
+    return []
+
+
 class ChatContextCollector:
     """从消息事件里抽取文本与图片。"""
 
