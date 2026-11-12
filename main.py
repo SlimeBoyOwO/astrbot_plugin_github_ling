@@ -66,7 +66,7 @@ try:  # 全局管理员列表
 except Exception:  # pragma: no cover
     astrbot_config = None  # type: ignore[assignment]
 
-PLUGIN_VERSION = "1.6.7"
+PLUGIN_VERSION = "1.6.8"
 
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
@@ -991,6 +991,16 @@ class GitHubLingPlugin(Star):
                 )
         else:
             lines.append("Issue 助手：关闭")
+
+        asset_mode = {
+            "attachment": "附件接口（不产生提交）",
+            "repo": f"提交到分支 {self.cfg.issue_asset_branch}",
+            "none": "已关闭",
+        }.get(self.cfg.issue_asset_mode, self.cfg.issue_asset_mode)
+        lines.append(
+            f"截图上传：{asset_mode}；"
+            f"锚点仓库：{self.cfg.issue_asset_repo or 'Issue 所在仓库'}"
+        )
 
         lines.append(f"配置文件：{self.config_path or '未获取到路径'}")
         lines.append(f"状态文件：{self._store.path}")

@@ -1,15 +1,22 @@
 """把聊天里的截图放进 Issue。
 
-GitHub 的 Issue 正文只接受图片 URL，没有“上传附件”的公开 API。这里采用
-**Git Data API 提交到独立分支**的方式：
+GitHub 的 Issue 正文只接受图片 URL，没有写进文档的“上传附件”API。插件支持
+两种落盘方式（``issue_asset_mode``）：
 
-1. 把图片作为 blob 上传；
-2. 在 ``ling-assets``（可配置）分支上创建一个只包含新图片的提交；
-3. 用 ``raw.githubusercontent.com`` 的链接放进 Issue 正文。
+``attachment``（默认）
+    调用网页版评论框同款接口 ``POST https://uploads.github.com/user-attachments/assets``。
+    上传成功后拿到 ``https://github.com/user-attachments/assets/<uuid>`` 链接，
+    和手动往评论框里拖图片得到的是同一种地址。**不产生任何提交**，也不占
+    仓库空间；代价是接口未写进官方文档（GitHub CLI 2.99 起的 ``--attach``
+    也在用它），并且要求 Token 账号对目标仓库有 Write 权限。
 
-这样做的好处是只依赖 ``api.github.com``，不需要第三方图床，也不需要
-``github.com`` 网页上传接口（那个接口只认 Cookie）。代价是目标仓库需要一个
-有写权限的 Token，并且会多出一个 ``ling-assets`` 分支。
+``repo``
+    用 Git Data API 把图片提交到 ``ling-assets``（可配置）分支，再用
+    ``raw.githubusercontent.com`` 的链接放进正文。多一个分支和若干提交，
+    但完全不依赖未公开接口。
+
+两种模式都只依赖 API / uploads 域名，不需要第三方图床，也不需要
+``github.com`` 的 Cookie 会话。
 """
 
 from __future__ import annotations
@@ -31,6 +38,14 @@ from ..github.client import GitHubAPI
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_BYTES = 24 * 1024 * 1024
+
+# GitHub 附件存储接受的图片类型（bmp / svg 之外的冷门格式会被 422 拒掉）
+CONTENT_TYPES = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
 
 
 @dataclass(slots=True)
@@ -77,6 +92,8 @@ class AssetUploader:
         self._lock = asyncio.Lock()
         # 仓库写权限缓存：repo -> (时间戳, 是否可写)
         self._push_cache: dict[str, tuple[float, bool]] = {}
+        # 仓库数字 id 缓存：repo -> (时间戳, id)
+        self._repo_cache: dict[str, tuple[float, int]] = {}
 
     # ------------------------------------------------------------------ 读取
 
@@ -138,7 +155,7 @@ class AssetUploader:
     # ------------------------------------------------------------------ 上传
 
     async def upload(self, repo: str, images: list[str]) -> UploadResult:
-        """上传截图，返回可访问的 raw 链接列表。"""
+        """上传截图，返回可访问的图片链接列表。"""
         if not images:
             return UploadResult()
         if self.config.issue_asset_mode == "none":
@@ -154,14 +171,7 @@ class AssetUploader:
             return UploadResult(
                 urls=[],
                 failed=len(images),
-                note=(
-                    f"截图上传失败：Token 所属账号对 {target_repo} 没有写入权限。"
-                    "classic Token 需要 repo / public_repo 范围，"
-                    "并且该账号必须是仓库的协作者（Write 权限）；"
-                    "fine-grained Token 需要 Contents: Read and write。"
-                    "也可以把 issue_asset_repo 指向一个该账号有写权限的仓库，"
-                    "或把 issue_asset_mode 设为 none"
-                ),
+                note=self._no_write_note(target_repo),
             )
 
         # 1) 读取并筛选图片
@@ -201,28 +211,37 @@ class AssetUploader:
         for sha, data, extension in payloads:
             unique.setdefault(sha, (data, extension))
 
-        async with self._lock:
-            try:
-                urls, stage_error = await self._commit_batch(
-                    target_repo, branch, unique
-                )
-            except Exception as exc:
-                logger.warning("上传 Issue 截图失败: %s", exc)
+        if self.config.issue_asset_mode == "attachment":
+            repo_id = await self._repo_id(target_repo)
+            if not repo_id:
                 return UploadResult(
                     urls=[],
                     failed=len(images),
-                    note=f"截图上传失败：{self.api.last_error or exc}",
+                    note=(
+                        "截图上传失败：读取仓库信息失败"
+                        f"（{self.api.last_error or '未知错误'}）"
+                    ),
                 )
-            if not urls:
-                note = f"截图上传失败：{stage_error or '目标仓库没有写入权限'}"
-                if self.api.last_status in {401, 403, 404}:
-                    note += (
-                        "（GitHub 对无写权限的仓库可能返回 404/403："
-                        "请确认 Token 所属账号已被加为该仓库的协作者，"
-                        "classic Token 勾选 repo 或 public_repo，"
-                        "fine-grained Token 勾选 Contents: Read and write）"
+            urls, stage_error = await self._upload_attachments(repo_id, unique)
+        else:
+            async with self._lock:
+                try:
+                    urls, stage_error = await self._commit_batch(
+                        target_repo, branch, unique
                     )
-                return UploadResult(urls=[], failed=len(images), note=note)
+                except Exception as exc:
+                    logger.warning("上传 Issue 截图失败: %s", exc)
+                    return UploadResult(
+                        urls=[],
+                        failed=len(images),
+                        note=f"截图上传失败：{self.api.last_error or exc}",
+                    )
+        if not urls:
+            return UploadResult(
+                urls=[],
+                failed=len(images),
+                note=self._failure_note(stage_error),
+            )
 
         # 保持调用方顺序
         ordered: list[str] = []
@@ -231,10 +250,11 @@ class AssetUploader:
             if url and url not in ordered:
                 ordered.append(url)
 
-        note = ""
+        note = stage_error
         if failed:
             detail = "、".join(dict.fromkeys(reasons))
-            note = f"{failed} 张图片未能上传（{detail}）"
+            partial = f"{failed} 张图片未能上传（{detail}）"
+            note = f"{note}；{partial}" if note else partial
         return UploadResult(urls=ordered, failed=failed, note=note)
 
     async def _cannot_push(self, repo: str) -> bool:
@@ -251,6 +271,72 @@ class AssetUploader:
         can_push = bool(permissions.get("push"))
         self._push_cache[repo] = (time.time(), can_push)
         return not can_push
+
+    async def _repo_id(self, repo: str) -> int | None:
+        """仓库的数字 id（附件接口只认 REST 的 id，不是 GraphQL 的 node id）。"""
+        cached = self._repo_cache.get(repo)
+        if cached and time.time() - cached[0] < 3600:
+            return cached[1]
+        info = await self.api.get_repo(repo)
+        if not isinstance(info, dict):
+            return None
+        try:
+            repo_id = int(info.get("id"))
+        except (TypeError, ValueError):
+            return None
+        self._repo_cache[repo] = (time.time(), repo_id)
+        return repo_id
+
+    async def _upload_attachments(
+        self,
+        repo_id: int,
+        items: dict[str, tuple[bytes, str]],
+    ) -> tuple[dict[str, str], str]:
+        """逐张上传到 GitHub 附件存储，返回 ``(sha -> 链接, 失败原因)``。"""
+        urls: dict[str, str] = {}
+        errors: list[str] = []
+        for sha, (data, extension) in items.items():
+            content_type = CONTENT_TYPES.get(extension)
+            if not content_type:
+                errors.append(f"{extension} 格式不受支持")
+                continue
+            name = f"ling-{sha[:12]}.{extension}"
+            link = await self.api.upload_attachment(
+                repo_id, data, name, content_type
+            )
+            if link:
+                urls[sha] = link
+            elif self.api.last_error:
+                errors.append(str(self.api.last_error))
+        if not urls:
+            return {}, f"上传图片失败：{errors[0] if errors else '未知错误'}"
+        partial = ""
+        if errors:
+            detail = "、".join(dict.fromkeys(errors))
+            partial = f"{len(errors)} 张图片未能上传（{detail}）"
+        return urls, partial
+
+    def _no_write_note(self, repo: str) -> str:
+        action = "截图上传" if self.config.issue_asset_mode == "attachment" else "提交截图"
+        return (
+            f"截图上传失败：Token 所属账号对 {repo} 没有写入权限。"
+            f"{action}要求该账号是仓库的协作者（Write 权限）；"
+            "classic Token 需要 repo / public_repo 范围，"
+            "fine-grained Token 需要 Contents: Read and write。"
+            "也可以把 issue_asset_repo 指向一个该账号有写权限的仓库，"
+            "或把 issue_asset_mode 设为 none"
+        )
+
+    def _failure_note(self, stage_error: str) -> str:
+        note = f"截图上传失败：{stage_error or '目标仓库没有写入权限'}"
+        if self.api.last_status in {401, 403, 404}:
+            note += (
+                "（GitHub 对无写权限的仓库可能返回 404/403："
+                "请确认 Token 所属账号已被加为该仓库的协作者，"
+                "classic Token 勾选 repo 或 public_repo，"
+                "fine-grained Token 勾选 Contents: Read and write）"
+            )
+        return note
 
     def _target_repo(self, repo: str) -> str:
         """截图存放到哪个仓库：配置合法时用配置，否则退回目标仓库。"""

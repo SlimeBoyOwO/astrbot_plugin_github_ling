@@ -143,22 +143,27 @@
 
 **截图怎么进 Issue**
 
-GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”接口。插件采用 Git Data API：
-把图片作为 blob 提交到目标仓库的一个**专门分支**（默认 `ling-assets`，按 `issue-assets/年月/`
-分目录，文件名是内容哈希，重复图片不会重复提交），再把 `raw.githubusercontent.com` 链接放进正文。
+GitHub 的 Issue 正文只接受图片 URL，官方 REST 文档里没有“上传附件”接口。
+插件默认调用**网页评论框同款**的附件接口
+（`POST https://uploads.github.com/user-attachments/assets`，GitHub CLI 2.99 起的
+`gh issue comment --attach` 用的也是它）：图片直接进入 GitHub 的附件存储，
+返回 `https://github.com/user-attachments/assets/<uuid>` 链接，写进正文后正常渲染。
+**不产生提交、不多出分支、不占仓库空间**，和自己往评论框里拖图片完全一样。
 
 - 需要 Token **所属账号对目标仓库有写权限**：classic Token 勾选 `repo` / `public_repo`，
   并且该账号必须是仓库的协作者（Write）；fine-grained Token 勾选 `Contents: Read and write`。
-  仅有 `repo` 范围但账号不是协作者时，公开仓库仍能创建 Issue，却无法提交截图
-  （GitHub 对这类写操作通常返回 404/403）；
-- 没有写权限时 Issue 仍会创建，正文里会注明“截图上传失败”并说明原因；
-  也可以把 `issue_asset_repo` 指向一个 Token 账号有写权限的仓库（例如自己的图床仓库）；
-- 截图分支不存在时会创建一个**只含图片的根提交**，不会复制默认分支的整棵文件树；
-  已有分支则沿用原来的树，只追加新图片；
+  仅有 `repo` 范围但账号不是协作者时，公开仓库仍能创建 Issue，却无法上传截图
+  （附件接口对无写权限的仓库返回 404，GitHub 用 404 掩盖权限不足）；
+- 附件链接在被 Issue / 评论引用之前是 404，引用之后才生效（别把链接单独发出去）；
+- 没写权限时 Issue 仍会创建，正文会注明“截图上传失败”并说明原因；
+  `issue_asset_repo` 可以指向任意一个有写权限的仓库作为写入锚点；
+- 这个接口没有写进官方文档，GitHub 改动后可能失效。想完全避开未公开接口，
+  把 `issue_asset_mode` 设为 `repo`：改用 Git Data API 把图片提交到 `ling-assets`
+  分支（按 `issue-assets/年月/` 分目录，文件名是内容哈希，重复图片不会重复提交），
+  再用 `raw.githubusercontent.com` 链接；
 - 图片下载失败时会再交给 AstrBot 的媒体缓存重试一次（更兼容 QQ 图床的临时链接与 UA 限制）；
-- 不想让仓库多一个分支：把 `issue_asset_mode` 设为 `none`；
-- 想集中存放：把 `issue_asset_repo` 指向一个专门的图床仓库；
-- 私有仓库的 raw 链接需要登录才能查看，别人看不到截图是正常现象。
+- 不想上传任何截图：把 `issue_asset_mode` 设为 `none`；
+- 私有仓库的附件 / raw 链接只有有权限的人能看，别人看不到是正常现象。
 
 **权限**
 
@@ -229,9 +234,9 @@ GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”�
 | `issue_llm_provider` | 空 | 指定模型提供商 ID，留空用会话默认模型 |
 | `issue_max_context_chars` | `6000` | 聊天记录最大长度，超出截断 |
 | `issue_max_images` | `4` | 最多附带几张截图 |
-| `issue_asset_mode` | `repo` | 截图上传方式：`repo`（提交到分支）/ `none`（不上传） |
-| `issue_asset_branch` | `ling-assets` | 截图提交到哪个分支，不存在会自动创建 |
-| `issue_asset_repo` | 空 | 截图存放到哪个仓库，留空为 Issue 所在仓库 |
+| `issue_asset_mode` | `attachment` | 截图上传方式：`attachment`（GitHub 附件接口，无提交）/ `repo`（提交到分支）/ `none`（不上传） |
+| `issue_asset_branch` | `ling-assets` | `repo` 模式下截图提交到哪个分支，不存在会自动创建 |
+| `issue_asset_repo` | 空 | 写入锚点仓库：`attachment` 模式只用来校验写权限，`repo` 模式是图片实际存放位置 |
 | `issue_timeout` | `90` | 生成草稿的超时时间（秒） |
 | `enable_webhook` | `false` | 开启后停止轮询，改由 GitHub 主动推送 |
 | `webhook_host` / `webhook_port` / `webhook_path` | `0.0.0.0` / `6193` / `/github/webhook` | Webhook 监听参数 |
@@ -402,7 +407,7 @@ astrbot_plugin_github_ling/
 │   ├── context.py          # 引用 / 合并转发 / 截图收集
 │   ├── templates.py        # Issue 模板解析与缓存
 │   ├── agent.py            # 提示词、模型调用、JSON 解析、创建 Issue
-│   ├── assets.py           # 截图提交到分支并生成链接
+│   ├── assets.py           # 截图上传（附件接口 / 分支）并生成链接
 │   └── draft.py            # 草稿存储与预览
 ├── tools/preview_cards.py  # 本地预览卡片
 └── metadata.yaml / _conf_schema.json / logo.png / LICENSE

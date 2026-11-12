@@ -106,7 +106,7 @@ class PluginConfig:
     issue_llm_provider: str = ""
     issue_max_context_chars: int = 6000
     issue_max_images: int = 4
-    issue_asset_mode: str = "repo"
+    issue_asset_mode: str = "attachment"
     issue_asset_branch: str = "ling-assets"
     issue_asset_repo: str = ""
     issue_timeout: int = 90
@@ -170,8 +170,12 @@ class PluginConfig:
         self.issue_max_images = as_int(
             get("issue_max_images", 4), 4, minimum=0, maximum=10
         )
-        mode = as_str(get("issue_asset_mode", "repo"), "repo").lower()
-        self.issue_asset_mode = mode if mode in {"repo", "none"} else "repo"
+        mode = as_str(
+            get("issue_asset_mode", "attachment"), "attachment"
+        ).lower()
+        self.issue_asset_mode = (
+            mode if mode in {"attachment", "repo", "none"} else "attachment"
+        )
         self.issue_asset_branch = as_str(
             get("issue_asset_branch", "ling-assets"), "ling-assets"
         )

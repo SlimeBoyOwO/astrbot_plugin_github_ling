@@ -146,11 +146,12 @@
     "description": "截图上传方式",
     "type": "string",
     "options": [
+      "attachment",
       "repo",
       "none"
     ],
-    "hint": "repo = 通过 GitHub API 把截图提交到目标仓库的一个专门分支（需要 Token 有写权限），Issue 里以图片展示；none = 不上传，只在 Issue 正文里注明有截图",
-    "default": "repo"
+    "hint": "attachment = 调用 GitHub 评论区同款附件接口（与 gh --attach 相同），不产生任何提交，推荐；repo = 把截图提交到仓库的一个专门分支；none = 不上传，只在正文里注明有截图。两种上传方式都要求 Token 账号对目标仓库有 Write 权限",
+    "default": "attachment"
   },
   "issue_asset_branch": {
     "description": "截图存放分支",
@@ -161,7 +162,7 @@
   "issue_asset_repo": {
     "description": "截图存放到哪个仓库",
     "type": "string",
-    "hint": "可选。留空表示存到 Issue 所在仓库；也可以指定一个专门的图床仓库，例如 owner/assets",
+    "hint": "可选。留空表示用 Issue 所在仓库；attachment 模式下这里是附件接口的写入锚点仓库（只用来校验写权限，不会产生文件），repo 模式下则是图片实际存放的仓库",
     "default": ""
   },
   "issue_timeout": {

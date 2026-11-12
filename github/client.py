@@ -25,6 +25,7 @@ import aiohttp
 from astrbot.api import logger
 
 API_BASE = "https://api.github.com"
+UPLOAD_BASE = "https://uploads.github.com"
 
 
 def _safe_url(url: str) -> str:
@@ -538,6 +539,91 @@ class GitHubAPI:
             timeout=30,
         )
         return data if isinstance(data, dict) and data.get("id") else None
+
+    async def upload_attachment(
+        self,
+        repo_id: int | str,
+        data: bytes,
+        name: str,
+        content_type: str,
+    ) -> str | None:
+        """把图片上传到 GitHub 的附件存储，返回 ``user-attachments`` 链接。
+
+        这是网页版评论框拖入图片时调用的接口
+        （``POST https://uploads.github.com/user-attachments/assets``），
+        不在官方 REST 文档里，但 GitHub CLI 2.99 起的
+        ``gh issue comment --attach`` 用的就是它。
+
+        * 只接受图片 / 视频（其它类型返回 422）；
+        * ``repository_id`` 必须是 Token 所属账号**有写权限**的仓库，
+          否则返回 404（与“仓库不存在”无法区分）；
+        * 返回的链接在被某条 Issue / PR / 评论引用之前是 404，
+          引用之后才会生效。
+        """
+        session = self._get_session()
+        self.last_error = None
+        self.last_status = None
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": content_type,
+            "User-Agent": "astrbot-plugin-github-ling",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
+        try:
+            async with session.post(
+                f"{UPLOAD_BASE}/user-attachments/assets",
+                params={
+                    "name": name,
+                    "content_type": content_type,
+                    "repository_id": str(repo_id),
+                },
+                data=data,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+                proxy=self.proxy or None,
+            ) as response:
+                self.last_status = response.status
+                text = await response.text()
+                if 200 <= response.status < 300:
+                    try:
+                        payload = json.loads(text)
+                    except json.JSONDecodeError:
+                        payload = {}
+                    link = ""
+                    if isinstance(payload, dict):
+                        link = str(payload.get("url") or "")
+                    if link.startswith("https://"):
+                        return link
+                    self.last_error = "上传接口没有返回图片地址"
+                    return None
+
+                detail = text[:160] or "无返回内容"
+                if response.status == 404:
+                    self.last_error = (
+                        "仓库没有写入权限（HTTP 404）：截图上传要求 Token "
+                        "所属账号对目标仓库有 Write 权限"
+                    )
+                elif response.status == 422:
+                    self.last_error = f"图片格式不受支持（HTTP 422）：{detail}"
+                elif response.status == 401:
+                    self.last_error = f"认证失败（HTTP 401）：{detail}"
+                else:
+                    self.last_error = f"HTTP {response.status}：{detail}"
+                logger.warning(
+                    "上传 GitHub 附件失败: HTTP %s %s", response.status, detail
+                )
+                return None
+        except asyncio.TimeoutError:
+            self.last_error = "连接 uploads.github.com 超时（60 秒）"
+            logger.warning("上传 GitHub 附件超时")
+            return None
+        except aiohttp.ClientError as exc:
+            self.last_error = f"网络错误：{exc}"
+            logger.warning("上传 GitHub 附件出错: %s", exc)
+            return None
 
     # ------------------------------------------------------------------ Git Data
     # 用来把聊天截图提交到独立分支，从而在 Issue 里以图片形式展示。
