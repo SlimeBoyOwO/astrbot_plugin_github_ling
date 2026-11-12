@@ -75,13 +75,13 @@ class DraftStore:
         self._items.clear()
 
 
-def format_preview(
+def preview_sections(
     draft: IssueDraft,
     *,
     require_confirm: bool = True,
     max_lines: int = 40,
-) -> str:
-    """把草稿渲染成一条预览消息。"""
+) -> list[tuple[str, str]]:
+    """把草稿拆成若干 (标题, 正文) 段，便于渲染成合并转发的多条消息。"""
     body = draft.body.strip() or "（正文为空）"
     preview_lines = head_lines(body, max_lines)
     preview = "\n".join(preview_lines)
@@ -89,27 +89,50 @@ def format_preview(
     if omitted > 0:
         preview += f"\n…（其余 {omitted} 行在创建后可见）"
 
-    lines = [
-        "🧾 待确认的 Issue",
-        f"仓库：{draft.repo}",
-        f"模板：{draft.template_name or '（无）'}",
-        f"标题：{draft.title}",
-        f"标签：{', '.join(draft.labels) if draft.labels else '（无）'}",
-        "────────────",
-        preview,
-        "────────────",
+    sections: list[tuple[str, str]] = [
+        (
+            "Issue 草稿",
+            "\n".join(
+                [
+                    f"仓库：{draft.repo}",
+                    f"模板：{draft.template_name or '（无）'}",
+                    f"标题：{draft.title}",
+                    f"标签：{', '.join(draft.labels) if draft.labels else '（无）'}",
+                ]
+            ),
+        ),
+        ("正文预览", preview),
     ]
+
+    actions: list[str] = []
     if draft.images:
-        lines.append(f"📎 截图：{len(draft.images)} 张（创建时一并上传）")
+        actions.append(f"截图：{len(draft.images)} 张（创建时一并上传）")
     if draft.model_note:
-        lines.append(f"💡 {draft.model_note}")
+        actions.append(draft.model_note)
     if require_confirm:
-        lines.append("发送 /ghissue ok 创建；/ghissue cancel 取消")
+        actions.append("发送 /ghissue ok 创建；/ghissue cancel 取消")
         index = draft.template_index or 1
-        lines.append(
+        actions.append(
             f"换模板重新生成：/ghissue tpl 序号（当前 {index}，/ghissue list 查看全部）"
         )
-    return "\n".join(lines)
+    if actions:
+        sections.append(("操作", "\n".join(actions)))
+    return sections
+
+
+def format_preview(
+    draft: IssueDraft,
+    *,
+    require_confirm: bool = True,
+    max_lines: int = 40,
+) -> str:
+    """把草稿渲染成一条纯文本预览（平台不支持合并转发时使用）。"""
+    return "\n\n".join(
+        f"{title}\n{body}"
+        for title, body in preview_sections(
+            draft, require_confirm=require_confirm, max_lines=max_lines
+        )
+    )
 
 
 def short_title(title: str, limit: int = 80) -> str:

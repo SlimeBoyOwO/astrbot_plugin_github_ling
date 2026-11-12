@@ -99,7 +99,7 @@ def _render_commit_event(
             lines.append(f"链接：{url}")
         return "\n".join(lines).strip()
 
-    lines = [f"🔨 {repo}"]
+    lines = [f"{repo} · 提交更新"]
     meta_plain = [f"提交: {len(commits)} 个"]
     if branch:
         meta_plain.insert(0, f"分支: {branch}")

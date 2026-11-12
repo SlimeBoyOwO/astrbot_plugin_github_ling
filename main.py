@@ -27,7 +27,12 @@ from urllib.parse import unquote, urlparse
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import (
+    AstrMessageEvent,
+    MessageChain,
+    MessageEventResult,
+    filter,
+)
 from astrbot.api.star import Context, Star, register
 
 from .core import targets
@@ -42,7 +47,7 @@ from .github.webhook import GitHubWebhookServer
 from .issue.agent import IssueAgent
 from .issue.assets import AssetUploader
 from .issue.context import ChatContextCollector
-from .issue.draft import DraftStore, format_preview
+from .issue.draft import DraftStore, format_preview, preview_sections
 from .issue.templates import TemplateCatalog
 from .render import card as card_render
 from .render import markdown as cards
@@ -57,7 +62,7 @@ try:  # 全局管理员列表
 except Exception:  # pragma: no cover
     astrbot_config = None  # type: ignore[assignment]
 
-PLUGIN_VERSION = "1.6.2"
+PLUGIN_VERSION = "1.6.3"
 
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
@@ -640,7 +645,7 @@ class GitHubLingPlugin(Star):
 
         if already:
             yield event.plain_result(
-                f"✅ 当前会话的默认仓库已切换为 {key}\n"
+                f"默认仓库已切换为 {key}\n"
                 "之后 /ghissue 会直接使用这个仓库。"
             )
             return
@@ -652,16 +657,16 @@ class GitHubLingPlugin(Star):
             else f"每 {self.cfg.check_interval} 分钟轮询"
         )
         note = (
-            "\n⚠️ 本次为 force 绑定，未校验仓库是否存在；仓库名写错将收不到推送。"
+            "\n! 本次为 force 绑定，未校验仓库是否存在；仓库名写错将收不到推送。"
             if skip_check
             else ""
         )
         yield event.plain_result(
-            f"✅ 已绑定仓库 {full_name}\n"
+            f"已绑定仓库 {full_name}\n"
             f"{description or '（未获取仓库描述）'}\n"
             f"推送方式：{mode}；Commit、PR、Issue 更新都会以卡片推送。\n"
-            f"它现在是本会话的默认仓库，/ghissue 会直接使用它"
-            f"（绑定多个仓库后用 /ghswitch 切换）。{note}"
+            f"默认仓库：/ghissue 会直接使用它（绑定多个仓库后用 /ghswitch 切换）。"
+            f"{note}"
         )
 
     @filter.command("ghunbind")
@@ -714,10 +719,10 @@ class GitHubLingPlugin(Star):
             )
             return
         active = self.active.get(subscriber)
-        lines = ["当前会话绑定的仓库："]
+        lines = ["当前会话绑定的仓库", ""]
         for repo in repos:
-            mark = "  ← 当前默认（/ghissue 使用）" if repo == active else ""
-            lines.append(f"- {repo}{mark}")
+            mark = "  [默认]" if repo == active else ""
+            lines.append(f"  · {repo}{mark}")
         if len(repos) > 1 or not active:
             lines.append("")
             lines.append("切换默认仓库：/ghswitch 用户名/仓库名")
@@ -737,10 +742,10 @@ class GitHubLingPlugin(Star):
                     "先发送 /ghbind 用户名/仓库名 绑定，再回来切换。"
                 )
                 return
-            lines = ["🔀 当前会话可切换的仓库："]
+            lines = ["当前会话可切换的仓库", ""]
             for index, item in enumerate(repos, start=1):
-                mark = "  ← 当前默认" if item == active else ""
-                lines.append(f"{index}. {item}{mark}")
+                mark = "  [默认]" if item == active else ""
+                lines.append(f"  {index}. {item}{mark}")
             lines.append("")
             lines.append("切换：/ghswitch 用户名/仓库名（也可以直接写序号）")
             yield event.plain_result("\n".join(lines))
@@ -776,11 +781,11 @@ class GitHubLingPlugin(Star):
 
         if already:
             yield event.plain_result(
-                f"🔀 已切换默认仓库为 {key}\n之后 /ghissue 会直接使用它。"
+                f"已切换默认仓库为 {key}\n之后 /ghissue 会直接使用它。"
             )
             return
         yield event.plain_result(
-            f"🔀 已切换默认仓库为 {key}\n"
+            f"已切换默认仓库为 {key}\n"
             "本会话也加入了它的推送列表（Commit / PR / Issue 更新会推到这里）。\n"
             "取消推送：/ghunbind 当前仓库名"
         )
@@ -802,14 +807,14 @@ class GitHubLingPlugin(Star):
                 return
             self.broadcasts.append(umo)
             self._save_state()
-            lines = ["✅ 已把当前会话加入推送列表"]
+            lines = ["已把当前会话加入推送列表"]
             if self.bindings:
                 lines.append(
                     f"之后 {len(self.bindings)} 个已绑定仓库的更新都会推送到这里。"
                 )
             else:
                 lines.append(
-                    "⚠️ 目前还没有绑定任何仓库，请先发送 /ghbind 用户名/仓库名"
+                    "! 目前还没有绑定任何仓库，请先发送 /ghbind 用户名/仓库名"
                 )
             lines.append("取消：/ghpush off")
             yield event.plain_result("\n".join(lines))
@@ -824,16 +829,16 @@ class GitHubLingPlugin(Star):
             yield event.plain_result("已把当前会话移出推送列表")
             return
 
-        lines = ["📢 额外推送目标（所有已绑定仓库的更新都会推到这里）"]
+        lines = ["额外推送目标（所有已绑定仓库的更新都会推到这里）", ""]
         if self.broadcasts:
-            lines.extend(f"- {item}（/ghpush 添加）" for item in self.broadcasts)
+            lines.extend(f"  · {item}  (/ghpush 添加)" for item in self.broadcasts)
         if self._configured_targets():
             lines.extend(
-                f"- {item}（配置项 push_targets）"
+                f"  · {item}  (配置项 push_targets)"
                 for item in self._configured_targets()
             )
         if not self.broadcasts and not self._configured_targets():
-            lines.append("- （暂无）")
+            lines.append("  （暂无）")
             lines.append("在群里发送 /ghpush on，本群就会开始接收推送")
         lines.append(f"当前会话：{umo}")
         yield event.plain_result("\n".join(lines))
@@ -851,10 +856,10 @@ class GitHubLingPlugin(Star):
             return
 
         repos, sent, failed = await self.poller.poll_once()
-        message = f"🔍 已检查 {repos} 个仓库，发现并推送 {sent} 条更新"
+        message = f"已检查 {repos} 个仓库，发现并推送 {sent} 条更新"
         if failed:
             message += (
-                f"\n⚠️ {failed} 个仓库本轮检查失败，已保留水位线，下轮会重试"
+                f"\n! {failed} 个仓库本轮检查失败，已保留水位线，下轮会重试"
                 f"（{self.api.last_error or '网络/API 错误'}）"
             )
         yield event.plain_result(message)
@@ -898,8 +903,8 @@ class GitHubLingPlugin(Star):
         self._save_state()
 
         yield event.plain_result(
-            f"⏪ 已将 {len(repos)} 个仓库的检查水位线回退 {delta} 分钟：\n"
-            + "\n".join(f"- {repo}" for repo in repos)
+            f"已将 {len(repos)} 个仓库的检查水位线回退 {delta} 分钟\n"
+            + "\n".join(f"  · {repo}" for repo in repos)
             + "\n下一轮轮询会重新检查这段时间；也可以发送 /ghcheck 立即触发。"
         )
 
@@ -911,7 +916,8 @@ class GitHubLingPlugin(Star):
         if not self.cfg.enable_webhook:
             mode += f"（每 {self.cfg.check_interval} 分钟）"
         lines = [
-            "📊 GitHub Ling 状态",
+            "GitHub Ling · 运行状态",
+            "────────────────────",
             f"版本：{PLUGIN_VERSION}",
             f"模式：{mode}",
             f"Token：{'已配置' if self.cfg.github_token else '未配置（60 次/小时限额）'}",
@@ -1038,17 +1044,21 @@ class GitHubLingPlugin(Star):
             yield event.plain_result(self._cancel_issue(event))
             return
         if head in TEMPLATE_WORDS:
-            yield event.plain_result("🧩 正在换模板重新生成…")
-            yield event.plain_result(await self._regenerate_issue(event, raw))
+            yield event.plain_result("正在换模板重新生成…")
+            yield self._wrap_result(
+                event, await self._regenerate_issue(event, raw)
+            )
             return
         if single and head in LIST_WORDS:
             yield event.plain_result(await self._list_templates(event, raw))
             return
 
-        yield event.plain_result("🤔 正在阅读聊天记录并整理 Issue 草稿…")
-        yield event.plain_result(await self._start_issue(event, raw))
+        yield event.plain_result("正在阅读聊天记录并整理 Issue 草稿…")
+        yield self._wrap_result(event, await self._start_issue(event, raw))
 
-    async def _start_issue(self, event: AstrMessageEvent, raw: str) -> str:
+    async def _start_issue(
+        self, event: AstrMessageEvent, raw: str
+    ) -> str | MessageEventResult:
         repo, option_error = self._issue_options(raw)
         if option_error:
             return option_error
@@ -1064,9 +1074,7 @@ class GitHubLingPlugin(Star):
         if not instruction and not self._has_material(event):
             draft = self.drafts.get(umo, user_id)
             if draft:
-                return format_preview(
-                    draft, require_confirm=self.cfg.issue_require_confirm
-                )
+                return self._draft_result(event, draft, note=note)
 
         collector = ChatContextCollector(
             max_chars=self.cfg.issue_max_context_chars,
@@ -1090,15 +1098,17 @@ class GitHubLingPlugin(Star):
             user_id=user_id,
         )
         if not draft:
-            return f"❌ 生成失败：{error}"
+            return f"生成失败：{error}"
 
         self.drafts.put(draft)
         prefix = f"{note}\n" if note else ""
         if self.cfg.issue_require_confirm:
-            return prefix + format_preview(draft, require_confirm=True)
+            return self._draft_result(event, draft, note=note)
         return prefix + await self._publish_draft(event, draft)
 
-    async def _regenerate_issue(self, event: AstrMessageEvent, raw: str) -> str:
+    async def _regenerate_issue(
+        self, event: AstrMessageEvent, raw: str
+    ) -> str | MessageEventResult:
         draft = self.drafts.get(event.unified_msg_origin, self._user_id(event))
         if not draft or draft.chat is None:
             return "没有待确认的草稿。请先引用一条消息发送 /ghissue 生成草稿。"
@@ -1122,11 +1132,9 @@ class GitHubLingPlugin(Star):
             user_id=self._user_id(event),
         )
         if not new_draft:
-            return f"❌ 重新生成失败：{error}"
+            return f"重新生成失败：{error}"
         self.drafts.put(new_draft)
-        return format_preview(
-            new_draft, require_confirm=self.cfg.issue_require_confirm
-        )
+        return self._draft_result(event, new_draft)
 
     def _cancel_issue(self, event: AstrMessageEvent) -> str:
         draft = self.drafts.pop(event.unified_msg_origin, self._user_id(event))
@@ -1144,9 +1152,57 @@ class GitHubLingPlugin(Star):
     async def _publish_draft(self, event: AstrMessageEvent, draft) -> str:
         url, error = await self.issue_agent.publish(draft)
         if not url:
-            return f"❌ 创建失败：{error}\n草稿已保留，可以稍后重试 /ghissue ok"
+            return f"创建失败：{error}\n草稿已保留，可以稍后重试 /ghissue ok"
         self.drafts.pop(event.unified_msg_origin, self._user_id(event))
-        return f"✅ 已创建 Issue：{url}"
+        return f"已创建 Issue：{url}"
+
+    # ------------------------------------------------------------------ Issue 预览
+
+    @staticmethod
+    def _wrap_result(
+        event: AstrMessageEvent, value: str | MessageEventResult
+    ) -> MessageEventResult:
+        if isinstance(value, MessageEventResult):
+            return value
+        return event.plain_result(str(value))
+
+    @staticmethod
+    def _supports_forward(event: AstrMessageEvent) -> bool:
+        """当前平台是否支持合并转发（QQ / Satori）。"""
+        if not (hasattr(Comp, "Node") and hasattr(Comp, "Nodes")):
+            return False
+        try:
+            name = str(event.get_platform_name() or "").lower()
+        except Exception:
+            return False
+        return name in {"aiocqhttp", "satori"}
+
+    @staticmethod
+    def _forward_node(event: AstrMessageEvent, title: str, body: str) -> Any:
+        uin = str(getattr(getattr(event, "message_obj", None), "self_id", "") or "0")
+        text = f"{title}\n{body}" if title else body
+        return Comp.Node(content=[Comp.Plain(text)], name="GitHub Ling", uin=uin)
+
+    def _draft_result(
+        self,
+        event: AstrMessageEvent,
+        draft: Any,
+        *,
+        note: str = "",
+    ) -> str | MessageEventResult:
+        """把草稿渲染成合并转发消息；平台不支持时退回纯文本。"""
+        require_confirm = self.cfg.issue_require_confirm
+        if not self._supports_forward(event):
+            text = format_preview(draft, require_confirm=require_confirm)
+            return f"{note}\n{text}" if note else text
+
+        sections = preview_sections(draft, require_confirm=require_confirm)
+        if note:
+            sections.insert(0, ("提示", note))
+        nodes = [
+            self._forward_node(event, title, body) for title, body in sections
+        ]
+        return event.chain_result([Comp.Nodes(nodes)])
 
     async def _list_templates(self, event: AstrMessageEvent, raw: str) -> str:
         repo_arg, option_error = self._issue_options(raw)
@@ -1163,10 +1219,10 @@ class GitHubLingPlugin(Star):
                 f"{repo} 没有配置 Issue 模板（.github/ISSUE_TEMPLATE），"
                 "生成时会使用内置的通用结构。"
             )
-        lines = [f"📋 {repo} 的 Issue 模板："]
+        lines = [f"{repo} 的 Issue 模板", ""]
         for index, item in enumerate(templates, start=1):
-            suffix = f" —— {item.description}" if item.description else ""
-            lines.append(f"{index}. {item.name}{suffix}")
+            suffix = f"  —— {item.description}" if item.description else ""
+            lines.append(f"  {index}. {item.name}{suffix}")
         lines.append("")
         lines.append("用 /ghissue tpl 序号 换模板重新生成草稿")
         return prefix + "\n".join(lines)
@@ -1252,7 +1308,7 @@ class GitHubLingPlugin(Star):
             return (
                 key,
                 "",
-                f"ℹ️ 本次使用其他会话绑定的 {key}；"
+                f"本次使用其他会话绑定的 {key}；"
                 f"发送 /ghbind {key} 可让本会话也接收推送。",
             )
 
@@ -1283,7 +1339,7 @@ class GitHubLingPlugin(Star):
             return (
                 repo,
                 "",
-                f"ℹ️ 本会话还没绑定仓库，本次使用你在其他会话绑定的 {repo}；"
+                f"本会话还没绑定仓库，本次使用你在其他会话绑定的 {repo}；"
                 f"发送 /ghbind {repo} 可让本会话也接收推送。",
             )
         if len(user_repos) > 1:
@@ -1302,7 +1358,7 @@ class GitHubLingPlugin(Star):
             return (
                 repo,
                 "",
-                f"ℹ️ 本会话还没绑定仓库，本次使用全局唯一绑定的 {repo}；"
+                f"本会话还没绑定仓库，本次使用全局唯一绑定的 {repo}；"
                 f"发送 /ghbind {repo} 可让本会话也接收推送。",
             )
         if not self.bindings:
