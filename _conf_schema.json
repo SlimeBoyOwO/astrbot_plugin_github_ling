@@ -77,9 +77,12 @@
     "default": 3
   },
   "push_targets": {
-    "description": "额外推送目标（群聊 / 私聊）",
+    "description": "额外推送目标列表（群聊 / 私聊）",
     "type": "list",
-    "hint": "默认只推送给执行 /ghbind 的会话。这里可以额外指定会话，它们会收到所有已绑定仓库的更新。每项填法：\n1. 完整会话标识 aiocqhttp:GroupMessage:123456789\n2. 简写 group:123456789 / private:123456789（群 / 私聊）\n3. 纯数字 123456789（按群聊处理）\n简写会用 push_platform 指定的平台，留空则自动推断。也可以直接在目标群里发送 /ghpush on。",
+    "items": {
+      "type": "string"
+    },
+    "hint": "这是一个列表控件：输入框右侧的「添加更多 / 修改」按钮可以逐条增删，配置 2 条以上会以标签形式展示；也可以点导入按钮按行粘贴。默认只推送给执行 /ghbind 的会话，这里额外指定的会话会收到所有已绑定仓库的更新。每项填法：\n1. 完整会话标识 aiocqhttp:GroupMessage:123456789\n2. 简写 group:123456789 / private:123456789（群 / 私聊）\n3. 纯数字 123456789（按群聊处理）\n简写会用 push_platform 指定的平台，留空则自动推断。也可以直接在目标群里发送 /ghpush on。",
     "default": []
   },
   "push_platform": {
@@ -97,8 +100,17 @@
   "issue_admin_only": {
     "description": "自动发 Issue 仅限管理员",
     "type": "bool",
-    "hint": "默认开启，避免群成员随意在仓库里创建 Issue。判定依据：AstrBot 的 admins_id 列表，或平台返回的管理员身份",
+    "hint": "默认开启，避免群成员随意在仓库里创建 Issue。判定依据见下一项 issue_admin_users；留空时使用 AstrBot 配置里的管理员 ID（admins_id），以及平台返回的管理员身份",
     "default": true
+  },
+  "issue_admin_users": {
+    "description": "允许自动发 Issue 的用户 ID",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "hint": "填写 QQ 号或平台返回的用户 ID（例如 123456789），可以填多个。填写后以此为准；留空则使用 AstrBot「配置 → 其他 → 管理员 ID（admins_id）」里的账号。如果两处都没有你的账号，/ghissue 会拒绝所有人，可以在这里加上自己，或关闭 issue_admin_only",
+    "default": []
   },
   "issue_require_confirm": {
     "description": "创建前需要确认",

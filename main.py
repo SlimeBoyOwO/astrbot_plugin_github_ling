@@ -56,6 +56,8 @@ try:  # 全局管理员列表
 except Exception:  # pragma: no cover
     astrbot_config = None  # type: ignore[assignment]
 
+PLUGIN_VERSION = "1.6.1"
+
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 
@@ -100,7 +102,7 @@ def _looks_like_image(data: bytes) -> bool:
     "astrbot_plugin_github_ling",
     "SlimeBoyOwO",
     "绑定 GitHub 仓库，用卡片推送 Commit、PR 与 Issue 更新；支持大模型自动发 Issue",
-    "1.6.0",
+    PLUGIN_VERSION,
 )
 class GitHubLingPlugin(Star):
     """GitHub 读写插件 - 灵
@@ -276,12 +278,18 @@ class GitHubLingPlugin(Star):
         return targets.merge_targets(subscribers, self._broadcast_targets())
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
+        sender = self._user_id(event)
+        # 1) 插件配置里显式指定的用户（最直观，不依赖 AstrBot 全局配置）
+        allowed = {str(item) for item in (self.cfg.issue_admin_users or [])}
+        if sender and sender in allowed:
+            return True
+        # 2) 平台给出的管理员身份
         try:
             if event.is_admin():
                 return True
         except Exception:
             pass
-        sender = self._user_id(event)
+        # 3) AstrBot 全局 admins_id
         if not sender or astrbot_config is None:
             return False
         try:
@@ -579,6 +587,7 @@ class GitHubLingPlugin(Star):
             mode += f"（每 {self.cfg.check_interval} 分钟）"
         lines = [
             "📊 GitHub Ling 状态",
+            f"版本：{PLUGIN_VERSION}",
             f"模式：{mode}",
             f"Token：{'已配置' if self.cfg.github_token else '未配置（60 次/小时限额）'}",
             f"代理：{self.cfg.github_proxy or '未配置'}",
@@ -595,7 +604,8 @@ class GitHubLingPlugin(Star):
                 label = "未配置"
             lines.append(
                 f"Issue 助手：开启（模型：{label}；"
-                f"{'需确认' if self.cfg.issue_require_confirm else '直接发送'}）"
+                f"{'需确认' if self.cfg.issue_require_confirm else '直接发送'}；"
+                f"{'仅管理员' if self.cfg.issue_admin_only else '所有人可用'}）"
             )
         else:
             lines.append("Issue 助手：关闭")
@@ -656,8 +666,9 @@ class GitHubLingPlugin(Star):
         if self.cfg.issue_admin_only and not self._is_admin(event):
             yield event.plain_result(
                 "自动发 Issue 需要管理员权限。\n"
-                "可以在 AstrBot 的 admins_id 中加入你的账号，"
-                "或在插件配置中关闭 issue_admin_only。"
+                "在插件配置的 issue_admin_users 里填上你的 QQ 号，"
+                "或把账号加入 AstrBot 的 admins_id（管理员 ID），"
+                "也可以关闭 issue_admin_only 让所有人使用。"
             )
             return
 

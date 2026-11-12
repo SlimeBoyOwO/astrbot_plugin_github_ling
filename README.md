@@ -62,6 +62,9 @@
 简写需要知道平台 ID（如 `aiocqhttp`、`telegram`），可填在 `push_platform`；
 留空时插件先取已绑定会话的平台，再退到第一个已加载的平台适配器。
 
+管理面板里 `push_targets` 是一个**列表**控件：输入框右侧的「添加更多 / 修改」按钮
+可以逐条增删，配置 2 条以上会以标签形式显示（也可以用导入按钮按行粘贴多个）。
+
 几点约定：
 
 - 额外目标是**全局的**：收到的是所有已绑定仓库的更新，不区分仓库；
@@ -120,8 +123,14 @@ GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”�
 
 **权限**
 
-默认只有管理员能用（`issue_admin_only`）。判定依据是 AstrBot 的 `admins_id` 列表，
-或平台返回的管理员身份。关掉它则会话里的所有人都可以用。
+默认只有管理员能用（`issue_admin_only`），判定顺序：
+
+1. 插件配置里的 `issue_admin_users`（填 QQ 号 / 用户 ID，可以填多个）；
+2. 平台返回的管理员身份；
+3. AstrBot 全局配置里的管理员 ID（`admins_id`）。
+
+`issue_admin_users` 和 `admins_id` 都为空时 `/ghissue` 会拒绝所有人，
+这时要么把 QQ 号填进 `issue_admin_users`，要么关掉 `issue_admin_only`。
 
 **模型**
 
@@ -149,6 +158,7 @@ GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”�
 | `push_platform` | 空 | `push_targets` 用简写时所属的平台 ID，例如 `aiocqhttp`；留空自动推断 |
 | `issue_enabled` | `true` | 是否启用自动发 Issue |
 | `issue_admin_only` | `true` | 只有管理员能使用 `/ghissue` |
+| `issue_admin_users` | 空 | 允许使用 `/ghissue` 的用户 ID（QQ 号），留空则用 AstrBot 的 `admins_id` |
 | `issue_require_confirm` | `true` | 先生成草稿，`/ghissue ok` 后才创建 |
 | `issue_template_auto` | `true` | 多个模板时由模型选；关闭后默认用第一个 |
 | `issue_llm_provider` | 空 | 指定模型提供商 ID，留空用会话默认模型 |

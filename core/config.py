@@ -100,6 +100,7 @@ class PluginConfig:
     # 自动发 Issue
     issue_enabled: bool = True
     issue_admin_only: bool = True
+    issue_admin_users: list[str] | None = None
     issue_require_confirm: bool = True
     issue_template_auto: bool = True
     issue_llm_provider: str = ""
@@ -157,6 +158,7 @@ class PluginConfig:
 
         self.issue_enabled = as_bool(get("issue_enabled", True), True)
         self.issue_admin_only = as_bool(get("issue_admin_only", True), True)
+        self.issue_admin_users = as_list(get("issue_admin_users", []))
         self.issue_require_confirm = as_bool(
             get("issue_require_confirm", True), True
         )
