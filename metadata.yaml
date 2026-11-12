@@ -5,6 +5,7 @@ help: |
   /ghbind 用户名/仓库名    绑定仓库到当前会话（也接受完整 GitHub 链接）
   /ghunbind [仓库]         取消绑定，省略参数则取消当前会话全部绑定
   /ghbindlist              查看当前会话绑定的仓库
+  /ghswitch [仓库]         切换当前会话默认使用的仓库（自动发 Issue 用它）
   /ghpush on|off|list      把当前会话（例如某个群）加入/移出额外推送目标
   /ghissue [说明]          引用一条消息（日志 / 合并转发 / 截图）自动生成 Issue
   /ghissue ok|cancel       确认或放弃草稿
@@ -12,6 +13,6 @@ help: |
   /ghcheck                 立即检查一次更新（轮询模式下有效）
   /ghrewind [分钟]         回退检查水位线，找回漏掉的更新
   /ghstatus                查看运行模式、检查间隔、Token 与 API 连通性
-version: 1.6.1
+version: 1.6.2
 author: SlimeBoyOwO
 repo: https://github.com/SlimeBoyOwO/astrbot_plugin_github_ling

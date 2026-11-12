@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -56,10 +57,15 @@ try:  # 全局管理员列表
 except Exception:  # pragma: no cover
     astrbot_config = None  # type: ignore[assignment]
 
-PLUGIN_VERSION = "1.6.1"
+PLUGIN_VERSION = "1.6.2"
 
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
+
+# 群主 / 群管理员在 OneBot 事件里的 role 取值
+GROUP_ADMIN_ROLES = {"owner", "admin"}
+# 查询群成员身份的结果缓存时间（秒）
+ADMIN_CACHE_TTL = 300
 
 REPO_PATTERN = re.compile(r"^[\w.-]+/[\w.-]+$")
 REPO_IN_TEXT_PATTERN = re.compile(r"github\.com/([\w.-]+)/([\w.-]+)")
@@ -120,6 +126,7 @@ class GitHubLingPlugin(Star):
     /ghbind 用户名/仓库名 force  跳过 API 校验直接绑定（服务器连不上 api.github.com 时使用）
     /ghunbind [仓库]         取消绑定，省略参数则取消当前会话全部绑定
     /ghbindlist              查看当前会话绑定的仓库
+    /ghswitch [仓库]         切换当前会话默认使用的仓库（/ghissue 用它）
     /ghpush on|off|list      把当前会话（例如某个群）加入/移出额外推送目标
     /ghissue [说明|ok|cancel|tpl N|list]  根据引用的聊天记录自动发 Issue
     /ghcheck                 立即检查一次更新（轮询模式）
@@ -150,6 +157,25 @@ class GitHubLingPlugin(Star):
             for item in (state.get("broadcasts") or [])
             if str(item).strip()
         ]
+        # 每个会话当前默认使用的仓库（/ghissue 优先用它）
+        self.active: dict[str, str] = {
+            str(session): str(repo)
+            for session, repo in (state.get("active") or {}).items()
+        }
+        # 仓库 → {会话: 绑定者用户 ID}，用于「私聊绑定、群里发 Issue」的回退
+        self.binding_users: dict[str, dict[str, str]] = {}
+        for repo, mapping in (state.get("binding_users") or {}).items():
+            if isinstance(mapping, dict):
+                self.binding_users[str(repo)] = {
+                    str(session): str(user) for session, user in mapping.items()
+                }
+        self._prune_state()
+
+        # 配置文件热加载（手工改 JSON 后无需重载插件）
+        self._config_cache: dict[str, Any] | None = None
+        self._config_stamp: tuple[int, int] | None = None
+        # 群管理员身份查询缓存：(群号, 用户) -> (时间戳, 是否管理员)
+        self._admin_cache: dict[tuple[str, str], tuple[float, bool]] = {}
 
         self.api = GitHubAPI(
             self.cfg.github_token,
@@ -193,12 +219,49 @@ class GitHubLingPlugin(Star):
     # ------------------------------------------------------------------ 配置
 
     def _sync_config(self) -> None:
-        """每次命令 / 推送前同步配置，避免改了配置却未重载插件。"""
-        self.cfg.refresh(self.raw_config)
+        """每次命令 / 推送前同步配置，避免改了配置却未重载插件。
+
+        面板里改配置时 AstrBot 会就地更新 ``AstrBotConfig``；如果是手工编辑
+        ``data/config/astrbot_plugin_github_ling_config.json``，这里会把磁盘上的
+        新值合并进来，省得再重启一次机器人。
+        """
+        source: Any = self.raw_config
+        disk = self._read_config_file()
+        if disk:
+            merged = dict(self.raw_config)
+            merged.update(disk)
+            source = merged
+        self.cfg.refresh(source)
         self.api.token = self.cfg.github_token
         self.api.proxy = self.cfg.github_proxy
         self.api.ca_bundle = self.cfg.github_ca_bundle
         self.api.ssl_verify = self.cfg.github_ssl_verify
+
+    @property
+    def config_path(self) -> str:
+        return str(getattr(self.raw_config, "config_path", "") or "")
+
+    def _read_config_file(self) -> dict[str, Any] | None:
+        """读取插件配置文件（按 mtime/size 缓存，避免每次命令都读盘）。"""
+        path = self.config_path
+        if not path:
+            return None
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        if stamp == self._config_stamp:
+            return self._config_cache
+        try:
+            with open(path, encoding="utf-8-sig") as file:
+                data = json.load(file)
+        except Exception as exc:
+            logger.warning("读取插件配置 %s 失败: %s", path, exc)
+            return self._config_cache
+        self._config_stamp = stamp
+        self._config_cache = data if isinstance(data, dict) else None
+        return self._config_cache
 
     def _server_now_iso(self, safety_seconds: int = 0) -> str:
         return server_now_iso(self.api, safety_seconds)
@@ -233,11 +296,80 @@ class GitHubLingPlugin(Star):
     # ------------------------------------------------------------------ 状态
 
     def _save_state(self) -> None:
+        self._prune_state()
         self._store.save(
             bindings=self.bindings,
             watermarks=self.watermarks,
             broadcasts=self.broadcasts,
+            active=self.active,
+            binding_users=self.binding_users,
         )
+
+    def _prune_state(self) -> None:
+        """清掉已经失效的默认仓库 / 绑定者记录（例如解绑之后的残留）。"""
+        for repo in list(self.binding_users):
+            subscribers = self.bindings.get(repo)
+            if not subscribers:
+                self.binding_users.pop(repo, None)
+                continue
+            mapping = self.binding_users[repo]
+            for session in list(mapping):
+                if session not in subscribers:
+                    mapping.pop(session, None)
+            if not mapping:
+                self.binding_users.pop(repo, None)
+        for session, repo in list(self.active.items()):
+            if session not in self.bindings.get(repo, []):
+                self.active.pop(session, None)
+
+    # ------------------------------------------------------------------ 绑定关系
+
+    def _session_repos(self, umo: str) -> list[str]:
+        """当前会话绑定的仓库（按绑定顺序）。"""
+        return [
+            repo for repo, subscribers in self.bindings.items() if umo in subscribers
+        ]
+
+    def _user_repos(self, umo: str, user_id: str) -> list[str]:
+        """同一用户在其它会话里绑定过的仓库。
+
+        既看 ``binding_users`` 里的显式记录，也兼容旧版状态文件：
+        私聊会话的 session_id 就是用户 ID（``aiocqhttp:FriendMessage:123``）。
+        """
+        found: list[str] = []
+        for repo, subscribers in self.bindings.items():
+            for session in subscribers:
+                if session == umo:
+                    continue
+                owner = (self.binding_users.get(repo) or {}).get(session)
+                if owner == user_id or self._session_is_private_of(session, user_id):
+                    if repo not in found:
+                        found.append(repo)
+                    break
+        return found
+
+    @staticmethod
+    def _session_is_private_of(session: str, user_id: str) -> bool:
+        if not user_id:
+            return False
+        parts = str(session).split(":")
+        if len(parts) < 3 or parts[-1] != user_id:
+            return False
+        return "friend" in parts[1].lower() or "private" in parts[1].lower()
+
+    def _set_active_repo(self, umo: str, repo: str) -> None:
+        self.active[umo] = repo
+
+    def _record_binder(self, repo: str, umo: str, user_id: str) -> None:
+        if user_id:
+            self.binding_users.setdefault(repo, {})[umo] = user_id
+
+    def _forget_binding(self, repo: str, umo: str) -> None:
+        (self.binding_users.get(repo) or {}).pop(umo, None)
+        if self.binding_users.get(repo) == {}:
+            self.binding_users.pop(repo, None)
+        if self.active.get(umo) == repo:
+            self.active.pop(umo, None)
 
     # ------------------------------------------------------------------ 推送目标
 
@@ -277,26 +409,142 @@ class GitHubLingPlugin(Star):
     def _delivery_targets(self, subscribers: list[str]) -> list[str]:
         return targets.merge_targets(subscribers, self._broadcast_targets())
 
-    def _is_admin(self, event: AstrMessageEvent) -> bool:
-        sender = self._user_id(event)
-        # 1) 插件配置里显式指定的用户（最直观，不依赖 AstrBot 全局配置）
-        allowed = {str(item) for item in (self.cfg.issue_admin_users or [])}
-        if sender and sender in allowed:
-            return True
-        # 2) 平台给出的管理员身份
-        try:
-            if event.is_admin():
-                return True
-        except Exception:
-            pass
-        # 3) AstrBot 全局 admins_id
-        if not sender or astrbot_config is None:
-            return False
+    def _admin_ids(self) -> set[str]:
+        return {
+            str(item).strip()
+            for item in (self.cfg.issue_admin_users or [])
+            if str(item).strip()
+        }
+
+    def _global_admin_ids(self) -> set[str]:
+        if astrbot_config is None:
+            return set()
         try:
             admins = astrbot_config.get("admins_id", []) or []
         except Exception:
+            return set()
+        return {str(item).strip() for item in admins if str(item).strip()}
+
+    async def _is_admin(self, event: AstrMessageEvent) -> bool:
+        allowed, _ = await self._admin_check(event)
+        return allowed
+
+    async def _admin_check(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        """判断发送者能否使用 /ghissue，并返回依据（方便 /ghstatus 排查）。"""
+        sender = self._user_id(event)
+
+        # 1) 插件配置里显式指定的用户（群聊 / 私聊都有效）
+        if sender and sender in self._admin_ids():
+            return True, "issue_admin_users"
+
+        # 2) 平台事件直接给出的身份（部分适配器会填 event.role / sender.role）
+        role = self._event_role(event)
+        if role in GROUP_ADMIN_ROLES:
+            return True, "群主/群管理员"
+
+        # 3) 平台适配器认为的管理员
+        try:
+            if event.is_admin():
+                return True, "平台管理员"
+        except Exception:
+            pass
+
+        # 4) AstrBot 全局 admins_id
+        if sender and sender in self._global_admin_ids():
+            return True, "admins_id"
+
+        # 5) 兜底：向平台查询群成员身份（aiocqhttp 的 event.role 恒为 member）
+        if await self._remote_group_admin(event, sender):
+            return True, "群主/群管理员"
+        return False, "未授权"
+
+    @staticmethod
+    def _event_role(event: AstrMessageEvent) -> str:
+        try:
+            role = str(getattr(event, "role", "") or "").lower()
+        except Exception:
+            role = ""
+        if role in GROUP_ADMIN_ROLES:
+            return role
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if isinstance(raw, dict):
+            sender = raw.get("sender")
+        else:
+            sender = getattr(raw, "sender", None)
+        if isinstance(sender, dict):
+            role = str(sender.get("role") or "").lower()
+        else:
+            role = str(getattr(sender, "role", "") or "").lower()
+        return role if role in GROUP_ADMIN_ROLES else ""
+
+    def _platform_client(self, event: AstrMessageEvent):
+        """拿到当前消息所在平台适配器的客户端（用于查询群成员身份）。"""
+        try:
+            name = str(event.platform_meta.name or "")
+            platform_id = str(event.platform_meta.id or "")
+        except Exception:
+            name, platform_id = "", ""
+        try:
+            insts = self.context.platform_manager.platform_insts
+        except Exception:
+            return None
+        for inst in insts:
+            try:
+                meta = inst.meta()
+                if name and str(meta.name) != name and str(meta.id) != platform_id:
+                    continue
+                client = inst.get_client()
+            except Exception:
+                continue
+            if hasattr(client, "call_action"):
+                return client
+        return None
+
+    async def _remote_group_admin(self, event: AstrMessageEvent, sender: str) -> bool:
+        if not sender:
             return False
-        return sender in {str(item) for item in admins}
+        try:
+            if event.is_private_chat():
+                return False
+        except Exception:
+            pass
+
+        group_id = ""
+        try:
+            group_id = str(event.get_group_id() or "")
+        except Exception:
+            group_id = ""
+        if not group_id:
+            group = getattr(getattr(event, "message_obj", None), "group", None)
+            group_id = str(getattr(group, "group_id", "") or "")
+        if not group_id.isdigit() or not sender.isdigit():
+            return False
+
+        key = (group_id, sender)
+        cached = self._admin_cache.get(key)
+        if cached and time.time() - cached[0] < ADMIN_CACHE_TTL:
+            return cached[1]
+
+        client = self._platform_client(event)
+        if client is None:
+            return False
+        try:
+            info = await asyncio.wait_for(
+                client.call_action(
+                    "get_group_member_info",
+                    group_id=int(group_id),
+                    user_id=int(sender),
+                    no_cache=True,
+                ),
+                timeout=5,
+            )
+        except Exception as exc:
+            logger.debug("查询群成员身份失败: %s", exc)
+            return False
+
+        is_admin = str((info or {}).get("role", "")).lower() in GROUP_ADMIN_ROLES
+        self._admin_cache[key] = (time.time(), is_admin)
+        return is_admin
 
     # ------------------------------------------------------------------ 仓库参数
 
@@ -381,14 +629,21 @@ class GitHubLingPlugin(Star):
         subscriber = event.unified_msg_origin
         subscribers = self.bindings.setdefault(key, [])
 
-        if subscriber in subscribers:
-            yield event.plain_result(f"当前会话已经绑定了 {key}")
-            return
-
-        subscribers.append(subscriber)
+        already = subscriber in subscribers
+        if not already:
+            subscribers.append(subscriber)
         if key not in self.watermarks:
             self.watermarks[key] = self._server_now_iso()
+        self._record_binder(key, subscriber, self._user_id(event))
+        self._set_active_repo(subscriber, key)
         self._save_state()
+
+        if already:
+            yield event.plain_result(
+                f"✅ 当前会话的默认仓库已切换为 {key}\n"
+                "之后 /ghissue 会直接使用这个仓库。"
+            )
+            return
 
         description = str((info or {}).get("description") or "").strip()
         mode = (
@@ -404,7 +659,9 @@ class GitHubLingPlugin(Star):
         yield event.plain_result(
             f"✅ 已绑定仓库 {full_name}\n"
             f"{description or '（未获取仓库描述）'}\n"
-            f"推送方式：{mode}；Commit、PR、Issue 更新都会以卡片推送。{note}"
+            f"推送方式：{mode}；Commit、PR、Issue 更新都会以卡片推送。\n"
+            f"它现在是本会话的默认仓库，/ghissue 会直接使用它"
+            f"（绑定多个仓库后用 /ghswitch 切换）。{note}"
         )
 
     @filter.command("ghunbind")
@@ -424,6 +681,7 @@ class GitHubLingPlugin(Star):
 
             for key in removed:
                 self.bindings[key].remove(subscriber)
+                self._forget_binding(key, subscriber)
                 if not self.bindings[key]:
                     del self.bindings[key]
                     self.watermarks.pop(key, None)
@@ -438,6 +696,7 @@ class GitHubLingPlugin(Star):
             return
 
         self.bindings[key].remove(subscriber)
+        self._forget_binding(key, subscriber)
         if not self.bindings[key]:
             del self.bindings[key]
             self.watermarks.pop(key, None)
@@ -448,16 +707,82 @@ class GitHubLingPlugin(Star):
     async def list_bindings(self, event: AstrMessageEvent):
         """查看当前会话绑定的仓库"""
         subscriber = event.unified_msg_origin
-        repos = [
-            key for key, subscribers in self.bindings.items() if subscriber in subscribers
-        ]
+        repos = self._session_repos(subscriber)
         if not repos:
             yield event.plain_result(
                 "当前会话还没有绑定任何仓库，使用 /ghbind 用户名/仓库名 绑定"
             )
             return
+        active = self.active.get(subscriber)
+        lines = ["当前会话绑定的仓库："]
+        for repo in repos:
+            mark = "  ← 当前默认（/ghissue 使用）" if repo == active else ""
+            lines.append(f"- {repo}{mark}")
+        if len(repos) > 1 or not active:
+            lines.append("")
+            lines.append("切换默认仓库：/ghswitch 用户名/仓库名")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("ghswitch", alias={"ghuse", "gh切换", "ghselect"})
+    async def switch_repo(self, event: AstrMessageEvent, repo: str | None = None):
+        """切换当前会话默认使用的仓库。用法: /ghswitch 用户名/仓库名"""
+        subscriber = event.unified_msg_origin
+        repos = self._session_repos(subscriber)
+        active = self.active.get(subscriber)
+
+        if repo is None:
+            if not repos:
+                yield event.plain_result(
+                    "当前会话还没有绑定任何仓库。\n"
+                    "先发送 /ghbind 用户名/仓库名 绑定，再回来切换。"
+                )
+                return
+            lines = ["🔀 当前会话可切换的仓库："]
+            for index, item in enumerate(repos, start=1):
+                mark = "  ← 当前默认" if item == active else ""
+                lines.append(f"{index}. {item}{mark}")
+            lines.append("")
+            lines.append("切换：/ghswitch 用户名/仓库名（也可以直接写序号）")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        raw = repo.strip()
+        target = self._extract_repo(raw) or (
+            repos[int(raw) - 1] if raw.isdigit() and 0 < int(raw) <= len(repos) else None
+        )
+        if not target:
+            yield event.plain_result(
+                "请提供有效的仓库，例如：/ghswitch owner/repo"
+            )
+            return
+
+        key = self._find_binding_key(target)
+        if not key:
+            yield event.plain_result(
+                f"仓库 {target} 还没有绑定过。\n"
+                f"先发送 /ghbind {target} 绑定，之后就能用 /ghswitch 切换。"
+            )
+            return
+
+        subscribers = self.bindings.setdefault(key, [])
+        already = subscriber in subscribers
+        if not already:
+            subscribers.append(subscriber)
+            if key not in self.watermarks:
+                self.watermarks[key] = self._server_now_iso()
+        self._record_binder(key, subscriber, self._user_id(event))
+        self._set_active_repo(subscriber, key)
+        self._save_state()
+
+        if already:
+            yield event.plain_result(
+                f"🔀 已切换默认仓库为 {key}\n之后 /ghissue 会直接使用它。"
+            )
+            return
         yield event.plain_result(
-            "当前会话绑定的仓库：\n" + "\n".join(f"- {repo}" for repo in repos)
+            f"🔀 已切换默认仓库为 {key}\n"
+            "本会话也加入了它的推送列表（Commit / PR / Issue 更新会推到这里）。\n"
+            "取消推送：/ghunbind 当前仓库名"
         )
 
     @filter.command("ghpush", alias={"gh推送"})
@@ -607,8 +932,26 @@ class GitHubLingPlugin(Star):
                 f"{'需确认' if self.cfg.issue_require_confirm else '直接发送'}；"
                 f"{'仅管理员' if self.cfg.issue_admin_only else '所有人可用'}）"
             )
+            if self.cfg.issue_admin_only:
+                allowed, reason = await self._admin_check(event)
+                lines.append(
+                    f"你的 ID：{self._user_id(event) or '未知'}；"
+                    f"Issue 权限：{'可用' if allowed else '不可用'}（{reason}）"
+                )
         else:
             lines.append("Issue 助手：关闭")
+
+        lines.append(f"配置文件：{self.config_path or '未获取到路径'}")
+        lines.append(f"状态文件：{self._store.path}")
+        session_repos = self._session_repos(event.unified_msg_origin)
+        if session_repos:
+            active = self.active.get(event.unified_msg_origin)
+            lines.append(
+                "本会话默认仓库：" + (active or session_repos[0])
+                + (f"（共绑定 {len(session_repos)} 个）" if len(session_repos) > 1 else "")
+            )
+        else:
+            lines.append("本会话默认仓库：（未绑定）")
         if self.cfg.enable_webhook:
             lines.append(
                 f"监听地址：http://{self.cfg.webhook_host}:{self.cfg.webhook_port}{self.cfg.webhook_path}"
@@ -663,14 +1006,25 @@ class GitHubLingPlugin(Star):
                 "自动发 Issue 已在插件配置中关闭（issue_enabled）"
             )
             return
-        if self.cfg.issue_admin_only and not self._is_admin(event):
-            yield event.plain_result(
-                "自动发 Issue 需要管理员权限。\n"
-                "在插件配置的 issue_admin_users 里填上你的 QQ 号，"
-                "或把账号加入 AstrBot 的 admins_id（管理员 ID），"
-                "也可以关闭 issue_admin_only 让所有人使用。"
-            )
-            return
+        if self.cfg.issue_admin_only:
+            allowed, reason = await self._admin_check(event)
+            if not allowed:
+                sender = self._user_id(event)
+                admins = "、".join(sorted(self._admin_ids())) or "（空）"
+                yield event.plain_result(
+                    "自动发 Issue 需要管理员权限。\n"
+                    f"你的用户 ID：{sender or '未知'}\n"
+                    f"当前 issue_admin_users：{admins}\n"
+                    "以下任一种方式都可以获得权限：\n"
+                    "1. 群主 / 群管理员直接使用（插件会自动识别）；\n"
+                    "2. 在插件配置 issue_admin_users 里加上你的 QQ 号"
+                    "（私聊也有效）；\n"
+                    "3. 把账号加入 AstrBot 的 admins_id（管理员 ID）；\n"
+                    "4. 关闭 issue_admin_only 让所有人使用。\n"
+                    f"配置文件：{self.config_path or '未获取到路径'}\n"
+                    "发送 /ghstatus 可以查看插件读取到的配置路径与权限判定结果。"
+                )
+                return
 
         raw = str(action or "").strip()
         tokens = raw.split()
@@ -699,7 +1053,7 @@ class GitHubLingPlugin(Star):
         if option_error:
             return option_error
 
-        repo_name, error = self._issue_repo(event, repo)
+        repo_name, error, note = self._issue_repo(event, repo)
         if not repo_name:
             return error
 
@@ -739,9 +1093,10 @@ class GitHubLingPlugin(Star):
             return f"❌ 生成失败：{error}"
 
         self.drafts.put(draft)
+        prefix = f"{note}\n" if note else ""
         if self.cfg.issue_require_confirm:
-            return format_preview(draft, require_confirm=True)
-        return await self._publish_draft(event, draft)
+            return prefix + format_preview(draft, require_confirm=True)
+        return prefix + await self._publish_draft(event, draft)
 
     async def _regenerate_issue(self, event: AstrMessageEvent, raw: str) -> str:
         draft = self.drafts.get(event.unified_msg_origin, self._user_id(event))
@@ -797,13 +1152,14 @@ class GitHubLingPlugin(Star):
         repo_arg, option_error = self._issue_options(raw)
         if option_error:
             return option_error
-        repo, error = self._issue_repo(event, repo_arg)
+        repo, error, note = self._issue_repo(event, repo_arg)
         if not repo:
             return error
+        prefix = f"{note}\n" if note else ""
 
         templates = await self.templates.get(repo)
         if not templates:
-            return (
+            return prefix + (
                 f"{repo} 没有配置 Issue 模板（.github/ISSUE_TEMPLATE），"
                 "生成时会使用内置的通用结构。"
             )
@@ -813,7 +1169,7 @@ class GitHubLingPlugin(Star):
             lines.append(f"{index}. {item.name}{suffix}")
         lines.append("")
         lines.append("用 /ghissue tpl 序号 换模板重新生成草稿")
-        return "\n".join(lines)
+        return prefix + "\n".join(lines)
 
     # ------------------------------------------------------------------ Issue 参数
 
@@ -865,37 +1221,105 @@ class GitHubLingPlugin(Star):
         self,
         event: AstrMessageEvent,
         explicit: str | None,
-    ) -> tuple[str | None, str]:
-        subscribed = [
-            key
-            for key, subscribers in self.bindings.items()
-            if event.unified_msg_origin in subscribers
-        ]
+    ) -> tuple[str | None, str, str]:
+        """决定这次 Issue 发到哪个仓库。
+
+        返回 ``(仓库, 错误信息, 提示)``。查找顺序：
+
+        1. ``-r owner/repo`` 明确指定（只要该仓库被任何会话绑定过即可）；
+        2. 当前会话的默认仓库（``/ghbind`` / ``/ghswitch`` 设置）；
+        3. 当前会话唯一绑定的仓库；
+        4. 同一用户在其它会话（例如私聊）绑定过的仓库；
+        5. 全局唯一绑定的仓库。
+
+        第 4、5 步解决「私聊绑过了，群里还要再绑一次」的问题。
+        """
+        umo = event.unified_msg_origin
+        user_id = self._user_id(event)
+
         if explicit:
             target = self._extract_repo(explicit)
             key = self._find_binding_key(target)
-            if key and event.unified_msg_origin in self.bindings.get(key, []):
-                return key, ""
+            if not key:
+                return (
+                    None,
+                    f"仓库 {explicit} 还没有绑定过。\n"
+                    f"请先发送 /ghbind {explicit} 绑定。",
+                    "",
+                )
+            if umo in self.bindings.get(key, []):
+                return key, "", ""
             return (
-                None,
-                f"当前会话没有绑定仓库 {explicit}。\n"
-                "自动发 Issue 只允许操作当前会话已绑定的仓库，"
-                "请先发送 /ghbind 用户名/仓库名。",
+                key,
+                "",
+                f"ℹ️ 本次使用其他会话绑定的 {key}；"
+                f"发送 /ghbind {key} 可让本会话也接收推送。",
             )
 
-        if len(subscribed) == 1:
-            return subscribed[0], ""
-        if not subscribed:
+        session_repos = self._session_repos(umo)
+        active = self.active.get(umo)
+        if active and active in session_repos:
+            return active, "", ""
+        if len(session_repos) == 1:
+            return session_repos[0], "", ""
+        if len(session_repos) > 1:
+            listing = "\n".join(
+                f"- {item}{'（默认）' if item == active else ''}"
+                for item in session_repos
+            )
             return (
                 None,
-                "当前会话还没有绑定任何仓库。\n"
-                "请先发送 /ghbind 用户名/仓库名 绑定一个仓库。",
+                "当前会话绑定了多个仓库，请先选一个默认仓库：\n"
+                f"{listing}\n"
+                f"发送 /ghswitch {session_repos[0]} 切换，"
+                "或本次用 /ghissue -r 仓库名 指定。",
+                "",
             )
-        listing = "\n".join(f"- {item}" for item in subscribed)
+
+        # 当前会话没有绑定：看是不是同一个人在别处绑过（私聊 ↔ 群聊）
+        user_repos = self._user_repos(umo, user_id)
+        if len(user_repos) == 1:
+            repo = user_repos[0]
+            return (
+                repo,
+                "",
+                f"ℹ️ 本会话还没绑定仓库，本次使用你在其他会话绑定的 {repo}；"
+                f"发送 /ghbind {repo} 可让本会话也接收推送。",
+            )
+        if len(user_repos) > 1:
+            listing = "\n".join(f"- {item}" for item in user_repos)
+            return (
+                None,
+                "你在其他会话绑定了多个仓库，请指定这次发到哪一个：\n"
+                f"{listing}\n"
+                f"例如：/ghissue -r {user_repos[0]} 这个报错了\n"
+                "也可以先 /ghswitch 仓库名，把本群固定到这个仓库。",
+                "",
+            )
+
+        if len(self.bindings) == 1:
+            repo = next(iter(self.bindings))
+            return (
+                repo,
+                "",
+                f"ℹ️ 本会话还没绑定仓库，本次使用全局唯一绑定的 {repo}；"
+                f"发送 /ghbind {repo} 可让本会话也接收推送。",
+            )
+        if not self.bindings:
+            return (
+                None,
+                "还没有绑定任何仓库。\n"
+                "请先发送 /ghbind 用户名/仓库名 绑定一个仓库。",
+                "",
+            )
+
+        listing = "\n".join(f"- {item}" for item in list(self.bindings)[:10])
         return (
             None,
-            "当前会话绑定了多个仓库，请用 -r 指定其中一个：\n"
-            f"{listing}\n例如：/ghissue -r {subscribed[0]} 这个报错了",
+            "本会话还没有绑定仓库，而全局有多个仓库可选，请指定一个：\n"
+            f"{listing}\n"
+            "先在本会话 /ghbind 一个仓库，或本次用 /ghissue -r 仓库名 指定。",
+            "",
         )
 
     @staticmethod

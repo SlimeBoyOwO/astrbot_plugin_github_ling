@@ -22,10 +22,11 @@
 
 | 命令 | 说明 |
 | --- | --- |
-| `/ghbind 用户名/仓库名` | 绑定仓库到当前会话，也支持直接粘贴 `https://github.com/用户名/仓库名` |
+| `/ghbind 用户名/仓库名` | 绑定仓库到当前会话（并设为默认），也支持直接粘贴 `https://github.com/用户名/仓库名` |
 | `/ghbind 用户名/仓库名 force` | 跳过 API 校验直接绑定；服务器连不上 `api.github.com` 时配合 Webhook 模式使用 |
 | `/ghunbind [用户名/仓库名]` | 取消绑定；省略参数则取消当前会话的全部绑定 |
-| `/ghbindlist` | 查看当前会话绑定的仓库 |
+| `/ghbindlist` | 查看当前会话绑定的仓库与默认仓库 |
+| `/ghswitch [用户名/仓库名]` | 切换当前会话默认使用的仓库；不写参数则列出可选项 |
 | `/ghpush on` / `off` / `list` | 把**当前会话**（通常是某个群）加入/移出额外推送目标，查看全部目标 |
 | `/ghissue [说明]` | 引用一条消息后发送，由大模型生成 Issue 草稿（详见下文） |
 | `/ghissue ok` / `cancel` | 确认创建 / 放弃草稿 |
@@ -35,6 +36,33 @@
 | `/ghstatus` | 查看运行模式、间隔、Token、代理、API 连通性与剩余额度 |
 
 绑定后，该会话会收到仓库的 Commit、PR、Issue 更新推送。
+
+### 一个会话绑定多个仓库
+
+同一个群 / 私聊可以绑定多个仓库。最后绑定的那个（或用 `/ghswitch` 选的那个）是
+**默认仓库**，`/ghissue` 会优先用它：
+
+```
+/ghbind owner/repo-a
+/ghbind owner/repo-b      # 默认仓库变成 repo-b
+/ghswitch owner/repo-a    # 切回 repo-a
+/ghswitch                 # 列出可切换的仓库
+```
+
+### 私聊绑定、群里直接用
+
+绑定记录是**全局共享**的：只要某个仓库被绑定过，就可以在其它会话里用
+`/ghissue -r owner/repo` 指定它。更方便的是，同一个人在一个会话里绑定的仓库，
+在另一个会话里发 `/ghissue` 时会自动作为候选：
+
+```
+私聊：/ghbind owner/repo
+群里：/ghissue 这个报错了      # 自动使用你私聊绑定的 owner/repo，会附带提示
+群里：/ghbind owner/repo       # 如果希望本群也接收推送，再绑定一次即可
+```
+
+查找顺序：`-r` 指定 → 本会话默认仓库 → 本会话唯一绑定 → 同一用户在其他会话的绑定 →
+全局唯一绑定的仓库。都没有或存在多个候选时，插件会列出可选项让你指定。
 
 ## 推送到指定群聊
 
@@ -78,7 +106,7 @@
 带报错截图的图片消息），发送 `/ghissue` 即可。
 
 ```
-1. /ghbind owner/repo                 # 先在当前会话绑定仓库（自动发 Issue 只操作已绑定的仓库）
+1. /ghbind owner/repo                 # 绑定仓库（私聊里绑过的话，群里可以直接用）
 2. 引用一条群友的消息，发送 /ghissue 这个报错了
 3. 机器人回复草稿（标题 / 正文 / 标签 / 截图数量）
 4. /ghissue ok                         # 确认创建
@@ -125,12 +153,18 @@ GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”�
 
 默认只有管理员能用（`issue_admin_only`），判定顺序：
 
-1. 插件配置里的 `issue_admin_users`（填 QQ 号 / 用户 ID，可以填多个）；
-2. 平台返回的管理员身份；
-3. AstrBot 全局配置里的管理员 ID（`admins_id`）。
+1. 插件配置里的 `issue_admin_users`（填 QQ 号 / 用户 ID，可以填多个；群聊、私聊都有效）；
+2. **群主 / 群管理员**：优先读事件里的 `sender.role`，读不到时通过平台的
+   `get_group_member_info` 查询（结果缓存 5 分钟）；
+3. 平台适配器返回的管理员身份（`event.is_admin()`）；
+4. AstrBot 全局配置里的管理员 ID（`admins_id`）。
 
-`issue_admin_users` 和 `admins_id` 都为空时 `/ghissue` 会拒绝所有人，
-这时要么把 QQ 号填进 `issue_admin_users`，要么关掉 `issue_admin_only`。
+`issue_admin_users` 和 `admins_id` 都为空时，群里只有群主 / 群管理员能用；
+私聊则没有人能用。这时要么把 QQ 号填进 `issue_admin_users`，要么关掉 `issue_admin_only`。
+
+手工修改 `data/config/astrbot_plugin_github_ling_config.json` 后**不需要重启**：
+插件每次处理命令都会重新读取配置文件。发送 `/ghstatus` 可以看到当前用户 ID、
+读取到的配置路径以及权限判定依据，方便排查“明明填了 ID 却没权限”的问题。
 
 **模型**
 
@@ -157,8 +191,8 @@ GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”�
 | `push_targets` | 空 | 额外推送目标（群聊 / 私聊），详见上文「推送到指定群聊」 |
 | `push_platform` | 空 | `push_targets` 用简写时所属的平台 ID，例如 `aiocqhttp`；留空自动推断 |
 | `issue_enabled` | `true` | 是否启用自动发 Issue |
-| `issue_admin_only` | `true` | 只有管理员能使用 `/ghissue` |
-| `issue_admin_users` | 空 | 允许使用 `/ghissue` 的用户 ID（QQ 号），留空则用 AstrBot 的 `admins_id` |
+| `issue_admin_only` | `true` | 只有管理员能使用 `/ghissue`；群主 / 群管理员自动拥有权限 |
+| `issue_admin_users` | 空 | 允许使用 `/ghissue` 的用户 ID（QQ 号），群聊 / 私聊都有效 |
 | `issue_require_confirm` | `true` | 先生成草稿，`/ghissue ok` 后才创建 |
 | `issue_template_auto` | `true` | 多个模板时由模型选；关闭后默认用第一个 |
 | `issue_llm_provider` | 空 | 指定模型提供商 ID，留空用会话默认模型 |
@@ -285,7 +319,8 @@ python tools/preview_cards.py --render --render-markdown
 
 ## 数据
 
-绑定关系与轮询水位线保存在 `data/github_ling_state.json`：
+绑定关系与轮询水位线保存在 `data/github_ling_state.json`（**不在**插件配置
+`data/config/astrbot_plugin_github_ling_config.json` 里，后者只放设置项）：
 
 ```json
 {
@@ -295,9 +330,18 @@ python tools/preview_cards.py --render --render-markdown
   "watermarks": {
     "owner/repo": "2026-11-06T01:23:45Z"
   },
-  "broadcasts": ["aiocqhttp:GroupMessage:987654321"]
+  "broadcasts": ["aiocqhttp:GroupMessage:987654321"],
+  "active": {
+    "aiocqhttp:GroupMessage:123456": "owner/repo"
+  },
+  "binding_users": {
+    "owner/repo": {"aiocqhttp:GroupMessage:123456": "2372729680"}
+  }
 }
 ```
+
+- `active`：每个会话当前默认使用的仓库；
+- `binding_users`：谁在哪个会话绑定的，用于「私聊绑定、群里直接用」的回退。
 
 删除该文件即可清空所有会话的绑定。自动发 Issue 的草稿只放在内存里（15 分钟过期），
 不会写入状态文件；重启插件会丢失未确认的草稿。

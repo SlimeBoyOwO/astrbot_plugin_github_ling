@@ -1,4 +1,4 @@
-"""状态文件读写：绑定关系、轮询水位线、额外推送目标。
+"""状态文件读写：绑定关系、轮询水位线、额外推送目标、默认仓库。
 
 文件结构见 README「数据」一节。读取失败时返回空状态而不是抛异常，
 避免插件因为一个坏掉的 JSON 无法启动。
@@ -38,6 +38,8 @@ class StateStore:
         bindings: dict[str, list[str]],
         watermarks: dict[str, str],
         broadcasts: list[str],
+        active: dict[str, str] | None = None,
+        binding_users: dict[str, dict[str, str]] | None = None,
     ) -> None:
         try:
             directory = os.path.dirname(self.path)
@@ -49,6 +51,10 @@ class StateStore:
                         "bindings": bindings,
                         "watermarks": watermarks,
                         "broadcasts": broadcasts,
+                        # 会话 → 当前默认仓库（/ghissue 优先使用）
+                        "active": active or {},
+                        # 仓库 → {会话: 绑定者用户 ID}，用于跨会话（私聊 ↔ 群聊）回退
+                        "binding_users": binding_users or {},
                     },
                     file,
                     ensure_ascii=False,

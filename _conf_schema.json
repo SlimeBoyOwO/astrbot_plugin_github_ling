@@ -100,7 +100,7 @@
   "issue_admin_only": {
     "description": "自动发 Issue 仅限管理员",
     "type": "bool",
-    "hint": "默认开启，避免群成员随意在仓库里创建 Issue。判定依据见下一项 issue_admin_users；留空时使用 AstrBot 配置里的管理员 ID（admins_id），以及平台返回的管理员身份",
+    "hint": "默认开启，避免群成员随意在仓库里创建 Issue。群主 / 群管理员（平台能识别时）始终拥有权限；此外还会检查下一项 issue_admin_users 和 AstrBot 的 admins_id",
     "default": true
   },
   "issue_admin_users": {
@@ -109,7 +109,7 @@
     "items": {
       "type": "string"
     },
-    "hint": "填写 QQ 号或平台返回的用户 ID（例如 123456789），可以填多个。填写后以此为准；留空则使用 AstrBot「配置 → 其他 → 管理员 ID（admins_id）」里的账号。如果两处都没有你的账号，/ghissue 会拒绝所有人，可以在这里加上自己，或关闭 issue_admin_only",
+    "hint": "填写 QQ 号或平台返回的用户 ID（例如 123456789），可以填多个。这里指定的账号在群聊和私聊都能使用 /ghissue。群主 / 群管理员默认就有权限，无需填写。留空时只使用 AstrBot「配置 → 其他 → 管理员 ID（admins_id）」。修改后无需重启，插件会在下次命令时重新读取配置文件；发送 /ghstatus 可以查看当前用户 ID 与权限判定结果",
     "default": []
   },
   "issue_require_confirm": {
