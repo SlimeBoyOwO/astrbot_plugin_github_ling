@@ -1,6 +1,6 @@
 """把规范化后的 GitHub 事件渲染成卡片文本。
 
-图片卡片默认由 ``card_render.py`` 手绘（见 ``card_style=ling``）；
+图片卡片默认由 ``render/card.py`` 手绘（见 ``card_style=ling``）；
 本模块负责两种文本输出，既是 ``card_style=markdown`` 的正文，也是兜底：
 
 * ``markdown=True``  —— 交给 AstrBot 的 ``text_to_image`` 渲染成图片卡片；
@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import rich_body
-from .utils import first_lines, short_sha
+from ..core.texts import first_lines, short_sha
 
 ACTION_LABELS = {
     "opened": "新建",

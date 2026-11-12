@@ -1,7 +1,22 @@
+"""GitHub 读写插件 - 灵（AstrBot 入口）。
+
+这个文件只做三件事：
+
+1. 组装各模块（配置 / 状态 / 轮询 / 发送 / Issue 助手）；
+2. 注册命令并把参数转交给对应模块；
+3. 处理生命周期（启动轮询或 Webhook、卸载时清理）。
+
+具体逻辑都在子包里：
+
+* ``core/``   配置、状态、推送目标、文本与时间工具
+* ``github/`` REST 客户端、Webhook、轮询
+* ``render/`` 卡片渲染
+* ``issue/``  引用/合并转发解析、Issue 模板、大模型生成、截图上传
+"""
+
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import time
@@ -14,21 +29,33 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
-from . import cards, card_render
-from .github_api import GitHubAPI
-from .utils import first_line, now_iso, parse_time
-from .webhook_events import build_events
-from .webhook_server import GitHubWebhookServer
+from .core import targets
+from .core.config import PluginConfig
+from .core.paths import AVATAR_DIR
+from .core.state import StateStore
+from .core.timeutil import now_iso, parse_time
+from .github import events as webhook_events
+from .github.client import GitHubAPI
+from .github.poller import Poller, server_now_iso
+from .github.webhook import GitHubWebhookServer
+from .issue.agent import IssueAgent
+from .issue.assets import AssetUploader
+from .issue.context import ChatContextCollector
+from .issue.draft import DraftStore, format_preview
+from .issue.templates import TemplateCatalog
+from .render import card as card_render
+from .render import markdown as cards
 
-try:
-    from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+try:  # AstrBot >= 4.2x 才有 GreedyStr
+    from astrbot.core.star.filter.command import GreedyStr
+except Exception:  # pragma: no cover
+    GreedyStr = str  # type: ignore[assignment,misc]
 
-    _DATA_DIR = str(get_astrbot_data_path())
-except Exception:  # 兼容旧版本 AstrBot
-    _DATA_DIR = "data"
+try:  # 全局管理员列表
+    from astrbot.core.config import astrbot_config
+except Exception:  # pragma: no cover
+    astrbot_config = None  # type: ignore[assignment]
 
-STATE_FILE = os.path.join(_DATA_DIR, "github_ling_state.json")
-AVATAR_DIR = os.path.join(_DATA_DIR, "github_ling_avatars")
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 
@@ -39,25 +66,25 @@ REPO_IN_TEXT_PATTERN = re.compile(r"github\.com/([\w.-]+)/([\w.-]+)")
 # 超过该时间即放弃卡片、改用纯文本，避免阻塞后续通知。
 CARD_RENDER_TIMEOUT = 20
 
-# 推进水位线时回退几秒，避免 GitHub 秒级时间戳与查询快照之间的边界漏报
-WATERMARK_SAFETY_SECONDS = 2
-
-# 额外推送目标的简写前缀 → AstrBot 的消息类型
-# 会话标识（unified_msg_origin）格式为 platform_id:消息类型:会话ID
-TARGET_KIND_PREFIXES = {
-    "group": "GroupMessage",
-    "群": "GroupMessage",
-    "群聊": "GroupMessage",
-    "private": "FriendMessage",
-    "friend": "FriendMessage",
-    "私聊": "FriendMessage",
-    "好友": "FriendMessage",
+CONFIRM_WORDS = {
+    "ok",
+    "confirm",
+    "yes",
+    "y",
+    "发",
+    "确认",
+    "创建",
+    "提交",
+    "submit",
+    "create",
 }
-MESSAGE_TYPES = {"GroupMessage", "FriendMessage", "OtherMessage"}
+CANCEL_WORDS = {"cancel", "no", "n", "取消", "放弃", "abort", "discard"}
+TEMPLATE_WORDS = {"tpl", "template", "模板", "换模板"}
+LIST_WORDS = {"list", "ls", "模板列表", "templates"}
 
 
 def _looks_like_image(data: bytes) -> bool:
-    """粗略判断字节串是不是 PNG / JPEG / GIF / WebP 图片。"""
+    """粗略判断字节串是不是常见的图片格式。"""
     if not data:
         return False
     signatures = (
@@ -69,62 +96,22 @@ def _looks_like_image(data: bytes) -> bool:
     return any(data.startswith(signature) for signature in signatures)
 
 
-def _describe_issue_event(event: dict[str, Any]) -> str | None:
-    """把一条 issue event（标签、指派、标题、状态等）翻译成中文描述。"""
-    event_type = str(event.get("event") or "")
-    actor = str((event.get("actor") or {}).get("login") or "未知")
-    label = str((event.get("label") or {}).get("name") or "?")
-    assignee = str((event.get("assignee") or {}).get("login") or "?")
-    milestone = str((event.get("milestone") or {}).get("title") or "?")
-    rename = event.get("rename") or {}
-
-    if event_type == "labeled":
-        return f"{actor} 添加了标签：{label}"
-    if event_type == "unlabeled":
-        return f"{actor} 移除了标签：{label}"
-    if event_type == "assigned":
-        return f"{actor} 指派给：{assignee}"
-    if event_type == "unassigned":
-        return f"{actor} 取消指派：{assignee}"
-    if event_type == "renamed":
-        old = rename.get("from") or "?"
-        new = rename.get("to") or "?"
-        return f"{actor} 修改标题：{old} → {new}"
-    if event_type == "milestoned":
-        return f"{actor} 设置里程碑：{milestone}"
-    if event_type == "demilestoned":
-        return f"{actor} 移除里程碑：{milestone}"
-    if event_type == "locked":
-        return f"{actor} 锁定了讨论"
-    if event_type == "unlocked":
-        return f"{actor} 解锁了讨论"
-    if event_type == "closed":
-        return f"{actor} 关闭了"
-    if event_type == "reopened":
-        return f"{actor} 重新打开了"
-    if event_type == "committed":
-        sha = str(event.get("commit_id") or event.get("sha") or "")[:7]
-        return f"{actor} 推送了提交 {sha}" if sha else f"{actor} 推送了新的提交"
-    if event_type == "ready_for_review":
-        return f"{actor} 将 PR 标记为可审查"
-    if event_type == "review_requested":
-        return f"{actor} 请求了审查"
-    return None
-
-
 @register(
     "astrbot_plugin_github_ling",
     "SlimeBoyOwO",
-    "绑定 GitHub 仓库，用卡片推送 Commit、PR 与 Issue 更新",
-    "1.5.0",
+    "绑定 GitHub 仓库，用卡片推送 Commit、PR 与 Issue 更新；支持大模型自动发 Issue",
+    "1.6.0",
 )
 class GitHubLingPlugin(Star):
-    """GitHub 仓库消息推送
+    """GitHub 读写插件 - 灵
 
     绑定仓库后，插件会推送以下更新：
 
     - Commit：卡片展示短哈希与提交信息（如 feat: xxx）
     - PR / Issue：大标题 + 评论（或描述）的前 10 行
+
+    还可以引用一条消息（日志 / 合并转发的聊天记录 / 截图），
+    让大模型按仓库的 Issue 模板整理成 Issue 草稿，确认后发送到 GitHub。
 
     命令：
     /ghbind 用户名/仓库名    绑定仓库到当前会话（也可直接粘贴仓库链接）
@@ -132,6 +119,7 @@ class GitHubLingPlugin(Star):
     /ghunbind [仓库]         取消绑定，省略参数则取消当前会话全部绑定
     /ghbindlist              查看当前会话绑定的仓库
     /ghpush on|off|list      把当前会话（例如某个群）加入/移出额外推送目标
+    /ghissue [说明|ok|cancel|tpl N|list]  根据引用的聊天记录自动发 Issue
     /ghcheck                 立即检查一次更新（轮询模式）
     /ghrewind [分钟]         把水位线回退若干分钟，用于找回漏掉的事件
     /ghstatus                查看运行状态与 API 连通性
@@ -139,41 +127,12 @@ class GitHubLingPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context, config)
-        self.config = config or {}
+        self.raw_config = config or {}
+        self.cfg = PluginConfig.load(self.raw_config)
 
-        self.github_token = str(self.config.get("github_token", "") or "").strip()
-        self.github_proxy = str(self.config.get("github_proxy", "") or "").strip()
-        self.github_ca_bundle = str(
-            self.config.get("github_ca_bundle", "") or ""
-        ).strip()
-        self.github_ssl_verify = self._cfg_bool("github_ssl_verify", True)
-        self.check_interval = self._cfg_int("check_interval", 10, minimum=1)
-        self.send_card_image = self._cfg_bool("send_card_image", True)
-        self.card_style = str(self.config.get("card_style", "ling") or "ling").strip().lower()
-        if self.card_style not in ("ling", "markdown"):
-            self.card_style = "ling"
-        self.card_width = self._cfg_int("card_width", 960, minimum=480)
-        self.comment_line_limit = self._cfg_int(
-            "comment_line_limit", 10, minimum=1
-        )
-        self.max_commits_per_card = self._cfg_int(
-            "max_commits_per_card", 5, minimum=1
-        )
-        self.poll_comments = self._cfg_bool("poll_comments", True)
-        self.max_items_per_check = self._cfg_int(
-            "max_items_per_check", 3, minimum=1
-        )
-        self.push_platform = str(self.config.get("push_platform", "") or "").strip()
-
-        self.enable_webhook = self._cfg_bool("enable_webhook", False)
-        self.webhook_host = str(self.config.get("webhook_host", "0.0.0.0"))
-        self.webhook_port = self._cfg_int("webhook_port", 6193, minimum=1)
-        self.webhook_path = str(
-            self.config.get("webhook_path", "/github/webhook")
-        )
-        self.webhook_secret = str(self.config.get("webhook_secret", "") or "")
-
-        state = self._load_state()
+        store = StateStore()
+        state = store.load()
+        self._store = store
         self.bindings: dict[str, list[str]] = {
             str(repo): [str(item) for item in subscribers]
             for repo, subscribers in (state.get("bindings") or {}).items()
@@ -191,163 +150,145 @@ class GitHubLingPlugin(Star):
         ]
 
         self.api = GitHubAPI(
-            self.github_token,
-            proxy=self.github_proxy,
-            ca_bundle=self.github_ca_bundle,
-            ssl_verify=self.github_ssl_verify,
+            self.cfg.github_token,
+            proxy=self.cfg.github_proxy,
+            ca_bundle=self.cfg.github_ca_bundle,
+            ssl_verify=self.cfg.github_ssl_verify,
         )
+
+        self.poller = Poller(
+            api=self.api,
+            config=self.cfg,
+            bindings=self.bindings,
+            watermarks=self.watermarks,
+            deliver=self._deliver,
+            save_state=self._save_state,
+            server_now_iso=self._server_now_iso,
+        )
+
         self.webhook_server: GitHubWebhookServer | None = None
-        if self.enable_webhook:
+        if self.cfg.enable_webhook:
             self.webhook_server = GitHubWebhookServer(
                 plugin=self,
-                host=self.webhook_host,
-                port=self.webhook_port,
-                path=self.webhook_path,
-                secret=self.webhook_secret,
+                host=self.cfg.webhook_host,
+                port=self.cfg.webhook_port,
+                path=self.cfg.webhook_path,
+                secret=self.cfg.webhook_secret,
             )
 
-        self.task: asyncio.Task[Any] | None = None
-        self._poll_lock = asyncio.Lock()
+        # 自动发 Issue
+        self.templates = TemplateCatalog(self.api)
+        self.assets = AssetUploader(self.api, self.cfg)
+        self.drafts = DraftStore()
+        self.issue_agent = IssueAgent(
+            context=self.context,
+            api=self.api,
+            config=self.cfg,
+            catalog=self.templates,
+            uploader=self.assets,
+        )
 
-    def _cfg_int(self, key: str, default: int, *, minimum: int = 0) -> int:
-        try:
-            value = int(self.config.get(key, default))
-        except (TypeError, ValueError):
-            value = default
-        return max(minimum, value)
+    # ------------------------------------------------------------------ 配置
 
-    def _cfg_bool(self, key: str, default: bool) -> bool:
-        value = self.config.get(key, default)
-        if isinstance(value, str):
-            return value.strip().lower() not in {"false", "0", "no", "off", ""}
-        return bool(value)
-
-    def _sync_api_credentials(self) -> None:
-        """每次调用 API 前同步配置，避免改了 Token/代理却未重载插件。"""
-        token = str(self.config.get("github_token", "") or "").strip()
-        proxy = str(self.config.get("github_proxy", "") or "").strip()
-        self.github_token = token
-        self.github_proxy = proxy
-        self.api.token = token
-        self.api.proxy = proxy
+    def _sync_config(self) -> None:
+        """每次命令 / 推送前同步配置，避免改了配置却未重载插件。"""
+        self.cfg.refresh(self.raw_config)
+        self.api.token = self.cfg.github_token
+        self.api.proxy = self.cfg.github_proxy
+        self.api.ca_bundle = self.cfg.github_ca_bundle
+        self.api.ssl_verify = self.cfg.github_ssl_verify
 
     def _server_now_iso(self, safety_seconds: int = 0) -> str:
-        """优先使用 GitHub 服务器时间作为水位线，避免本机时钟偏差。"""
-        server_time = self.api.server_now()
-        if server_time is not None:
-            target = server_time - timedelta(seconds=max(0, safety_seconds))
-            return target.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        if safety_seconds:
-            local_time = parse_time(now_iso())
-            if local_time is not None:
-                local_time -= timedelta(seconds=safety_seconds)
-                return local_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-        return now_iso()
-
-    @staticmethod
-    def _find_closer(
-        issue_events: list[dict[str, Any]],
-        since: datetime,
-    ) -> str | None:
-        """找出水位线之后是谁关闭/合并了这条 Issue/PR。"""
-        latest: tuple[datetime, str] | None = None
-        for event in issue_events:
-            if not isinstance(event, dict):
-                continue
-            if str(event.get("event") or "") not in {"closed", "merged"}:
-                continue
-            event_time = parse_time(event.get("created_at"))
-            if event_time is None or event_time <= since:
-                continue
-            login = str((event.get("actor") or {}).get("login") or "")
-            if not login:
-                continue
-            if latest is None or event_time > latest[0]:
-                latest = (event_time, login)
-        return latest[1] if latest else None
-
-    def _describe_recent_events(
-        self,
-        issue_events: list[dict[str, Any]],
-        since: datetime,
-    ) -> str:
-        """取水位线之后的最新几条 issue event，拼成“变更内容”。"""
-        described: list[tuple[datetime, str]] = []
-        for event in issue_events:
-            if not isinstance(event, dict):
-                continue
-            event_time = parse_time(event.get("created_at"))
-            if event_time is None or event_time <= since:
-                continue
-            text = _describe_issue_event(event)
-            if text:
-                described.append((event_time, text))
-        described.sort(key=lambda pair: pair[0], reverse=True)
-        return "\n".join(text for _, text in described[:3])
+        return server_now_iso(self.api, safety_seconds)
 
     # ------------------------------------------------------------------ 生命周期
 
     async def initialize(self) -> None:
-        if self.enable_webhook:
+        self._sync_config()
+        if self.cfg.enable_webhook:
             assert self.webhook_server is not None
             try:
                 await self.webhook_server.start()
             except Exception as exc:
                 logger.error("启动 GitHub Ling Webhook 服务失败: %s", exc)
         else:
-            self.task = asyncio.create_task(self._poll_loop())
+            self.poller.start()
             logger.info(
                 "GitHub Ling 启动轮询模式：间隔 %s 分钟，已绑定 %s 个仓库",
-                self.check_interval,
+                self.cfg.check_interval,
                 len(self.bindings),
             )
 
     async def terminate(self) -> None:
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-            self.task = None
-
+        await self.poller.stop()
         if self.webhook_server:
             await self.webhook_server.stop()
-
         await self.api.close()
+        self.drafts.clear()
         self._save_state()
         logger.info("GitHub Ling 插件已卸载")
 
-    # ------------------------------------------------------------------ 状态存取
-
-    def _load_state(self) -> dict[str, Any]:
-        if not os.path.exists(STATE_FILE):
-            return {}
-        try:
-            with open(STATE_FILE, encoding="utf-8") as file:
-                data = json.load(file)
-            if isinstance(data, dict):
-                return data
-        except Exception as exc:
-            logger.error("读取 GitHub Ling 状态文件失败: %s", exc)
-        return {}
+    # ------------------------------------------------------------------ 状态
 
     def _save_state(self) -> None:
+        self._store.save(
+            bindings=self.bindings,
+            watermarks=self.watermarks,
+            broadcasts=self.broadcasts,
+        )
+
+    # ------------------------------------------------------------------ 推送目标
+
+    def _platform_ids(self) -> list[str]:
         try:
-            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-            with open(STATE_FILE, "w", encoding="utf-8") as file:
-                json.dump(
-                    {
-                        "bindings": self.bindings,
-                        "watermarks": self.watermarks,
-                        "broadcasts": self.broadcasts,
-                    },
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        except Exception as exc:
-            logger.error("保存 GitHub Ling 状态文件失败: %s", exc)
+            insts = self.context.platform_manager.platform_insts
+        except Exception:
+            return []
+        ids: list[str] = []
+        for inst in insts:
+            try:
+                platform_id = str(inst.meta().id or "")
+            except Exception:
+                continue
+            if platform_id:
+                ids.append(platform_id)
+        return ids
+
+    def _platform_hint(self) -> str:
+        return targets.platform_hint(
+            self.cfg.push_platform, self.bindings, self._platform_ids()
+        )
+
+    def _normalize_target(self, raw: Any) -> str | None:
+        return targets.normalize_target(raw, self._platform_hint())
+
+    def _configured_targets(self) -> list[str]:
+        return targets.configured_targets(
+            self.cfg.push_targets or [], self._platform_hint()
+        )
+
+    def _broadcast_targets(self) -> list[str]:
+        return targets.broadcast_targets(
+            self.broadcasts, self.cfg.push_targets or [], self._platform_hint()
+        )
+
+    def _delivery_targets(self, subscribers: list[str]) -> list[str]:
+        return targets.merge_targets(subscribers, self._broadcast_targets())
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        try:
+            if event.is_admin():
+                return True
+        except Exception:
+            pass
+        sender = self._user_id(event)
+        if not sender or astrbot_config is None:
+            return False
+        try:
+            admins = astrbot_config.get("admins_id", []) or []
+        except Exception:
+            return False
+        return sender in {str(item) for item in admins}
 
     # ------------------------------------------------------------------ 仓库参数
 
@@ -381,105 +322,7 @@ class GitHubLingPlugin(Star):
                 return key
         return None
 
-    # ------------------------------------------------------------------ 推送目标
-
-    def _platform_id_hint(self) -> str:
-        """推断简写目标应该用哪个平台适配器。"""
-        configured = str(self.config.get("push_platform", "") or "").strip()
-        if configured:
-            return configured
-
-        # 1) 已绑定会话里出现过的平台
-        for subscribers in self.bindings.values():
-            for umo in subscribers:
-                parts = str(umo).split(":", 2)
-                if len(parts) == 3 and parts[0]:
-                    return parts[0]
-
-        # 2) 当前已加载的平台适配器
-        try:
-            insts = self.context.platform_manager.platform_insts
-        except Exception:
-            insts = []
-        for inst in insts:
-            try:
-                platform_id = str(inst.meta().id or "")
-            except Exception:
-                continue
-            if platform_id:
-                return platform_id
-        return ""
-
-    def _normalize_target(self, raw: Any) -> str | None:
-        """把配置里的一条目标解析成 unified_msg_origin。
-
-        支持三种写法：
-
-        * 完整会话标识：``aiocqhttp:GroupMessage:123456789``
-        * 简写：``group:123456789`` / ``private:123456789``（也认「群/群聊/私聊」）
-        * 纯数字：``123456789``，按群聊处理
-
-        无法解析时返回 ``None``。
-        """
-        value = str(raw or "").strip().strip("\"'").strip()
-        if not value:
-            return None
-
-        if value.count(":") >= 2:
-            parts = value.split(":", 2)
-            if all(part.strip() for part in parts) and parts[1] in MESSAGE_TYPES:
-                return value
-            # 不是标准会话标识，继续按简写解析（例如 group:123 有两段）
-
-        head, _, rest = value.partition(":")
-        kind = TARGET_KIND_PREFIXES.get(head.strip().lower())
-        platform = self._platform_id_hint()
-        if kind:
-            rest = rest.strip()
-            if not rest or not platform:
-                return None
-            return f"{platform}:{kind}:{rest}"
-
-        if value.isdigit() and platform:
-            return f"{platform}:GroupMessage:{value}"
-        return None
-
-    def _configured_targets(self) -> list[str]:
-        """配置项 push_targets 里声明的额外目标。"""
-        raw = self.config.get("push_targets", [])
-        items: list[Any]
-        if isinstance(raw, list):
-            items = raw
-        elif isinstance(raw, str):
-            items = [line for line in raw.replace(",", "\n").splitlines()]
-        else:
-            items = []
-
-        targets: list[str] = []
-        for item in items:
-            target = self._normalize_target(item)
-            if target and target not in targets:
-                targets.append(target)
-        return targets
-
-    def _broadcast_targets(self) -> list[str]:
-        """所有额外目标：/ghpush 添加的 + 配置里写的。"""
-        targets: list[str] = []
-        for item in [*self.broadcasts, *self._configured_targets()]:
-            target = self._normalize_target(item) or item
-            if target and target not in targets:
-                targets.append(target)
-        return targets
-
-    def _delivery_targets(self, subscribers: list[str]) -> list[str]:
-        """本次推送的实际接收者：绑定会话 + 额外目标（去重，保持顺序）。"""
-        targets: list[str] = []
-        for item in [*subscribers, *self._broadcast_targets()]:
-            if item and item not in targets:
-                targets.append(item)
-        return targets
-
-    # ------------------------------------------------------------------ 命令
+    # ------------------------------------------------------------------ 命令：绑定
 
     @filter.command("ghbind")
     async def bind_repo(
@@ -489,7 +332,7 @@ class GitHubLingPlugin(Star):
         force: str | None = None,
     ):
         """绑定 GitHub 仓库。用法: /ghbind 用户名/仓库名 [force]"""
-        self._sync_api_credentials()
+        self._sync_config()
         target = self._extract_repo(repo)
         if not target:
             yield event.plain_result(
@@ -542,8 +385,8 @@ class GitHubLingPlugin(Star):
         description = str((info or {}).get("description") or "").strip()
         mode = (
             "Webhook 推送"
-            if self.enable_webhook
-            else f"每 {self.check_interval} 分钟轮询"
+            if self.cfg.enable_webhook
+            else f"每 {self.cfg.check_interval} 分钟轮询"
         )
         note = (
             "\n⚠️ 本次为 force 绑定，未校验仓库是否存在；仓库名写错将收不到推送。"
@@ -616,6 +459,7 @@ class GitHubLingPlugin(Star):
         action: str | None = None,
     ):
         """把当前会话加入额外推送目标。用法: /ghpush on|off|list"""
+        self._sync_config()
         value = str(action or "").strip().lower()
         umo = event.unified_msg_origin
 
@@ -661,16 +505,19 @@ class GitHubLingPlugin(Star):
         lines.append(f"当前会话：{umo}")
         yield event.plain_result("\n".join(lines))
 
+    # ------------------------------------------------------------------ 命令：检查
+
     @filter.command("ghcheck")
     async def check_now(self, event: AstrMessageEvent):
         """立即检查一次更新（轮询模式）"""
-        if self.enable_webhook:
+        self._sync_config()
+        if self.cfg.enable_webhook:
             yield event.plain_result(
                 "当前为 Webhook 模式，GitHub 会主动推送，无需手动检查"
             )
             return
 
-        repos, sent, failed = await self._poll_once()
+        repos, sent, failed = await self.poller.poll_once()
         message = f"🔍 已检查 {repos} 个仓库，发现并推送 {sent} 条更新"
         if failed:
             message += (
@@ -684,7 +531,7 @@ class GitHubLingPlugin(Star):
         self, event: AstrMessageEvent, minutes: str | None = None
     ):
         """把检查水位线回退若干分钟，找回漏掉的更新。用法: /ghrewind 10"""
-        if self.enable_webhook:
+        if self.cfg.enable_webhook:
             yield event.plain_result("Webhook 模式不使用水位线，无需回退")
             return
 
@@ -726,24 +573,35 @@ class GitHubLingPlugin(Star):
     @filter.command("ghstatus")
     async def show_status(self, event: AstrMessageEvent):
         """查看插件运行状态与 API 连通性"""
-        self._sync_api_credentials()
-        mode = "Webhook" if self.enable_webhook else "轮询"
-        if not self.enable_webhook:
-            mode += f"（每 {self.check_interval} 分钟）"
+        self._sync_config()
+        mode = "Webhook" if self.cfg.enable_webhook else "轮询"
+        if not self.cfg.enable_webhook:
+            mode += f"（每 {self.cfg.check_interval} 分钟）"
         lines = [
             "📊 GitHub Ling 状态",
             f"模式：{mode}",
-            f"Token：{'已配置' if self.github_token else '未配置（60 次/小时限额）'}",
-            f"代理：{self.github_proxy or '未配置'}",
-            f"TLS：{'自定义 CA' if self.github_ca_bundle else ('校验开启' if self.github_ssl_verify else '校验已关闭（不安全）')}",
+            f"Token：{'已配置' if self.cfg.github_token else '未配置（60 次/小时限额）'}",
+            f"代理：{self.cfg.github_proxy or '未配置'}",
+            f"TLS：{'自定义 CA' if self.cfg.github_ca_bundle else ('校验开启' if self.cfg.github_ssl_verify else '校验已关闭（不安全）')}",
             f"已绑定仓库：{len(self.bindings)} 个",
             f"额外推送目标：{len(self._broadcast_targets())} 个",
-            f"卡片图片：{'开启' if self.send_card_image else '关闭'}"
-            f"（{self.card_style}）",
+            f"卡片图片：{'开启' if self.cfg.send_card_image else '关闭'}"
+            f"（{self.cfg.card_style}）",
         ]
-        if self.enable_webhook:
+        if self.cfg.issue_enabled:
+            try:
+                label = await self.issue_agent.provider_label(event)
+            except Exception:
+                label = "未配置"
             lines.append(
-                f"监听地址：http://{self.webhook_host}:{self.webhook_port}{self.webhook_path}"
+                f"Issue 助手：开启（模型：{label}；"
+                f"{'需确认' if self.cfg.issue_require_confirm else '直接发送'}）"
+            )
+        else:
+            lines.append("Issue 助手：关闭")
+        if self.cfg.enable_webhook:
+            lines.append(
+                f"监听地址：http://{self.cfg.webhook_host}:{self.cfg.webhook_port}{self.cfg.webhook_path}"
             )
 
         # /rate_limit 不消耗配额，适合用来判断服务器能否访问 GitHub API
@@ -775,6 +633,296 @@ class GitHubLingPlugin(Star):
 
         yield event.plain_result("\n".join(lines))
 
+    # ------------------------------------------------------------------ 命令：自动发 Issue
+
+    @filter.command("ghissue", alias={"gh发issue", "ghnew"})
+    async def issue_command(self, event: AstrMessageEvent, action: GreedyStr):
+        """根据引用的消息 / 聊天记录自动生成 Issue。
+
+        用法：
+        /ghissue 补充说明       引用一条消息（可以是日志、合并转发、截图）后发送
+        /ghissue ok            确认创建草稿
+        /ghissue cancel        放弃草稿
+        /ghissue tpl 2         换用第 2 个模板重新生成
+        /ghissue list          查看仓库的 Issue 模板
+        /ghissue -r owner/repo 指定仓库
+        """
+        self._sync_config()
+        if not self.cfg.issue_enabled:
+            yield event.plain_result(
+                "自动发 Issue 已在插件配置中关闭（issue_enabled）"
+            )
+            return
+        if self.cfg.issue_admin_only and not self._is_admin(event):
+            yield event.plain_result(
+                "自动发 Issue 需要管理员权限。\n"
+                "可以在 AstrBot 的 admins_id 中加入你的账号，"
+                "或在插件配置中关闭 issue_admin_only。"
+            )
+            return
+
+        raw = str(action or "").strip()
+        tokens = raw.split()
+        head = tokens[0].lower() if tokens else ""
+        single = len(tokens) == 1
+
+        if single and head in CONFIRM_WORDS:
+            yield event.plain_result(await self._confirm_issue(event))
+            return
+        if single and head in CANCEL_WORDS:
+            yield event.plain_result(self._cancel_issue(event))
+            return
+        if head in TEMPLATE_WORDS:
+            yield event.plain_result("🧩 正在换模板重新生成…")
+            yield event.plain_result(await self._regenerate_issue(event, raw))
+            return
+        if single and head in LIST_WORDS:
+            yield event.plain_result(await self._list_templates(event, raw))
+            return
+
+        yield event.plain_result("🤔 正在阅读聊天记录并整理 Issue 草稿…")
+        yield event.plain_result(await self._start_issue(event, raw))
+
+    async def _start_issue(self, event: AstrMessageEvent, raw: str) -> str:
+        repo, option_error = self._issue_options(raw)
+        if option_error:
+            return option_error
+
+        repo_name, error = self._issue_repo(event, repo)
+        if not repo_name:
+            return error
+
+        instruction, template_index, template_name = self._parse_issue_args(raw)
+        umo = event.unified_msg_origin
+        user_id = self._user_id(event)
+
+        if not instruction and not self._has_material(event):
+            draft = self.drafts.get(umo, user_id)
+            if draft:
+                return format_preview(
+                    draft, require_confirm=self.cfg.issue_require_confirm
+                )
+
+        collector = ChatContextCollector(
+            max_chars=self.cfg.issue_max_context_chars,
+            max_images=self.cfg.issue_max_images,
+        )
+        chat = await collector.collect(event, instruction)
+        if chat.is_empty:
+            return (
+                "没有找到可用的聊天内容。\n"
+                "请引用一条消息（日志 / 报错 / 合并转发的聊天记录）后再发送 /ghissue，"
+                "或在命令后面写一句说明。"
+            )
+
+        draft, error = await self.issue_agent.generate(
+            event=event,
+            repo=repo_name,
+            chat=chat,
+            instruction=instruction,
+            template_index=template_index,
+            template_name=template_name,
+            user_id=user_id,
+        )
+        if not draft:
+            return f"❌ 生成失败：{error}"
+
+        self.drafts.put(draft)
+        if self.cfg.issue_require_confirm:
+            return format_preview(draft, require_confirm=True)
+        return await self._publish_draft(event, draft)
+
+    async def _regenerate_issue(self, event: AstrMessageEvent, raw: str) -> str:
+        draft = self.drafts.get(event.unified_msg_origin, self._user_id(event))
+        if not draft or draft.chat is None:
+            return "没有待确认的草稿。请先引用一条消息发送 /ghissue 生成草稿。"
+
+        tokens = raw.split()
+        argument = tokens[1] if len(tokens) > 1 else ""
+        index: int | None = None
+        name: str | None = None
+        if argument.isdigit():
+            index = int(argument)
+        elif argument:
+            name = argument
+
+        new_draft, error = await self.issue_agent.generate(
+            event=event,
+            repo=draft.repo,
+            chat=draft.chat,
+            instruction=draft.instruction,
+            template_index=index,
+            template_name=name,
+            user_id=self._user_id(event),
+        )
+        if not new_draft:
+            return f"❌ 重新生成失败：{error}"
+        self.drafts.put(new_draft)
+        return format_preview(
+            new_draft, require_confirm=self.cfg.issue_require_confirm
+        )
+
+    def _cancel_issue(self, event: AstrMessageEvent) -> str:
+        draft = self.drafts.pop(event.unified_msg_origin, self._user_id(event))
+        return "已放弃这份草稿" if draft else "当前没有待确认的草稿"
+
+    async def _confirm_issue(self, event: AstrMessageEvent) -> str:
+        draft = self.drafts.get(event.unified_msg_origin, self._user_id(event))
+        if not draft:
+            return (
+                "当前没有待确认的草稿。\n"
+                "请先引用一条消息发送 /ghissue 生成草稿。"
+            )
+        return await self._publish_draft(event, draft)
+
+    async def _publish_draft(self, event: AstrMessageEvent, draft) -> str:
+        url, error = await self.issue_agent.publish(draft)
+        if not url:
+            return f"❌ 创建失败：{error}\n草稿已保留，可以稍后重试 /ghissue ok"
+        self.drafts.pop(event.unified_msg_origin, self._user_id(event))
+        return f"✅ 已创建 Issue：{url}"
+
+    async def _list_templates(self, event: AstrMessageEvent, raw: str) -> str:
+        repo_arg, option_error = self._issue_options(raw)
+        if option_error:
+            return option_error
+        repo, error = self._issue_repo(event, repo_arg)
+        if not repo:
+            return error
+
+        templates = await self.templates.get(repo)
+        if not templates:
+            return (
+                f"{repo} 没有配置 Issue 模板（.github/ISSUE_TEMPLATE），"
+                "生成时会使用内置的通用结构。"
+            )
+        lines = [f"📋 {repo} 的 Issue 模板："]
+        for index, item in enumerate(templates, start=1):
+            suffix = f" —— {item.description}" if item.description else ""
+            lines.append(f"{index}. {item.name}{suffix}")
+        lines.append("")
+        lines.append("用 /ghissue tpl 序号 换模板重新生成草稿")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ Issue 参数
+
+    def _parse_issue_args(
+        self, raw: str
+    ) -> tuple[str, int | None, str | None]:
+        """解析 ``-r owner/repo``、``-t 2`` 与剩余说明文字。"""
+        tokens = raw.split()
+        index: int | None = None
+        name: str | None = None
+        position = 0
+        while position < len(tokens):
+            token = tokens[position]
+            if token in {"-t", "--template"} and position + 1 < len(tokens):
+                value = tokens[position + 1]
+                if value.isdigit():
+                    index = int(value)
+                else:
+                    name = value
+                position += 2
+                continue
+            if token in {"-r", "--repo"} and position + 1 < len(tokens):
+                position += 2
+                continue
+            break
+        instruction = " ".join(tokens[position:]).strip()
+        return instruction, index, name
+
+    def _issue_options(self, raw: str) -> tuple[str | None, str]:
+        """只解析命令开头的选项，取出 ``-r/--repo`` 的值。
+
+        只认开头的参数，避免把补充说明里的「-r」当成选项。
+        """
+        tokens = raw.split()
+        position = 0
+        while position < len(tokens):
+            token = tokens[position]
+            if token in {"-r", "--repo"}:
+                if position + 1 < len(tokens):
+                    return tokens[position + 1], ""
+                return None, "参数 -r 后面需要写仓库名，例如 -r owner/repo"
+            if token in {"-t", "--template"} and position + 1 < len(tokens):
+                position += 2
+                continue
+            break
+        return None, ""
+
+    def _issue_repo(
+        self,
+        event: AstrMessageEvent,
+        explicit: str | None,
+    ) -> tuple[str | None, str]:
+        subscribed = [
+            key
+            for key, subscribers in self.bindings.items()
+            if event.unified_msg_origin in subscribers
+        ]
+        if explicit:
+            target = self._extract_repo(explicit)
+            key = self._find_binding_key(target)
+            if key and event.unified_msg_origin in self.bindings.get(key, []):
+                return key, ""
+            return (
+                None,
+                f"当前会话没有绑定仓库 {explicit}。\n"
+                "自动发 Issue 只允许操作当前会话已绑定的仓库，"
+                "请先发送 /ghbind 用户名/仓库名。",
+            )
+
+        if len(subscribed) == 1:
+            return subscribed[0], ""
+        if not subscribed:
+            return (
+                None,
+                "当前会话还没有绑定任何仓库。\n"
+                "请先发送 /ghbind 用户名/仓库名 绑定一个仓库。",
+            )
+        listing = "\n".join(f"- {item}" for item in subscribed)
+        return (
+            None,
+            "当前会话绑定了多个仓库，请用 -r 指定其中一个：\n"
+            f"{listing}\n例如：/ghissue -r {subscribed[0]} 这个报错了",
+        )
+
+    @staticmethod
+    def _has_material(event: AstrMessageEvent) -> bool:
+        """消息里是否带了引用 / 合并转发 / 图片。"""
+        try:
+            components = list(event.get_messages() or [])
+        except Exception:
+            return False
+        material_types = tuple(
+            item
+            for item in (
+                getattr(Comp, name, None)
+                for name in ("Reply", "Forward", "Nodes", "Node", "Image")
+            )
+            if isinstance(item, type)
+        )
+        return any(isinstance(comp, material_types) for comp in components)
+
+    @staticmethod
+    def _user_id(event: AstrMessageEvent) -> str:
+        """取发送者 ID。
+
+        ``event.get_sender_id()`` 只在 ``user_id`` 是字符串时返回内容
+        （aiocqhttp 是 int），所以这里直接从 message_obj 里取并转成字符串，
+        避免同一群里的所有用户共用一份草稿。
+        """
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        uid = getattr(sender, "user_id", None)
+        if uid is not None:
+            text = str(uid).strip()
+            if text:
+                return text
+        try:
+            return str(event.get_sender_id() or "")
+        except Exception:
+            return ""
+
     # ------------------------------------------------------------------ Webhook 入口
 
     async def handle_webhook_event(
@@ -793,300 +941,13 @@ class GitHubLingPlugin(Star):
         if not key:
             return
 
-        events = build_events(event_type, payload)
+        events = webhook_events.build_events(event_type, payload)
         if not events:
             return
 
         subscribers = list(self.bindings.get(key, []))
         for event in events:
             await self._deliver(event, subscribers)
-
-    # ------------------------------------------------------------------ 轮询
-
-    async def _poll_loop(self) -> None:
-        # 稍等插件加载完成，避免与初始化流程抢资源
-        await asyncio.sleep(5)
-        while True:
-            try:
-                await self._poll_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("轮询 GitHub 更新时出错")
-            await asyncio.sleep(max(1, self.check_interval) * 60)
-
-    async def _poll_once(self) -> tuple[int, int, int]:
-        self._sync_api_credentials()
-        async with self._poll_lock:
-            checked = 0
-            sent = 0
-            failed = 0
-
-            for repo in list(self.bindings.keys()):
-                subscribers = list(self.bindings.get(repo) or [])
-                if not subscribers:
-                    continue
-
-                checked += 1
-                try:
-                    events, ok = await self._collect_updates(repo)
-                except Exception:
-                    logger.exception("检查仓库 %s 更新时出错", repo)
-                    events, ok = [], False
-
-                if not ok:
-                    # 关键：请求失败时绝不推进水位线，否则失败窗口内的事件会被永久跳过
-                    failed += 1
-                    logger.warning(
-                        "仓库 %s 本轮检查未完成（%s），保留水位线以便下轮重试",
-                        repo,
-                        self.api.last_error or "未知原因",
-                    )
-                    continue
-
-                for event in events:
-                    await self._deliver(event, subscribers)
-                    sent += 1
-
-                self.watermarks[repo] = self._server_now_iso(
-                    WATERMARK_SAFETY_SECONDS
-                )
-                logger.info(
-                    "仓库 %s 本轮检查完成，发现 %s 条更新", repo, len(events)
-                )
-
-            if checked:
-                self._save_state()
-            return checked, sent, failed
-
-    async def _collect_updates(
-        self, repo: str
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """收集仓库更新。
-
-        Returns:
-            ``(events, ok)``。``ok=False`` 表示本轮有请求失败，调用方必须保留
-            水位线，下一轮从旧水位线重新检查，避免漏报。
-        """
-        since = parse_time(self.watermarks.get(repo))
-        if since is None:
-            self.watermarks[repo] = self._server_now_iso()
-            return [], True
-
-        since_param = since.strftime("%Y-%m-%dT%H:%M:%SZ")
-        events: list[dict[str, Any]] = []
-
-        # 1) 提交（GitHub 默认分支，按时间倒序返回）
-        commits = await self.api.list_commits(repo, since_param)
-        if commits is None:
-            return [], False
-
-        commit_items = []
-        for commit in commits:
-            commit_data = commit.get("commit") or {}
-            commit_time = parse_time(
-                (commit_data.get("committer") or {}).get("date")
-            )
-            if commit_time is None:
-                continue
-            if commit_time <= since:
-                break
-            commit_items.append(
-                {
-                    "sha": str(commit.get("sha") or ""),
-                    "subject": first_line(commit_data.get("message")),
-                    "url": str(commit.get("html_url") or ""),
-                    "author": (commit_data.get("author") or {}).get("name")
-                    or "未知",
-                }
-            )
-
-        if commit_items:
-            events.append(
-                {
-                    "kind": "commit",
-                    "repo": repo,
-                    "branch": None,
-                    "action": "push",
-                    "actor": commit_items[0].get("author") or "未知",
-                    "commits": commit_items,
-                    "url": commit_items[0].get("url") or "",
-                }
-            )
-
-        # 2) Issue / PR（按 updated_at 倒序）
-        issues = await self.api.list_issues(repo, since_param)
-        if issues is None:
-            return [], False
-
-        comment_fetches = 0
-        event_fetches = 0
-        review_fetches = 0
-        for item in issues:
-            updated = parse_time(item.get("updated_at"))
-            if updated is None or updated <= since:
-                break
-
-            kind = "pr" if "pull_request" in item else "issue"
-            number = item.get("number")
-            author = str((item.get("user") or {}).get("login") or "未知")
-            actor = author
-            body = str(item.get("body") or "")
-            body_label = "描述"
-            action = "updated"
-            url = str(item.get("html_url") or "")
-
-            created = parse_time(item.get("created_at"))
-            is_new = created is not None and created > since
-            state_action = None
-            if item.get("state") == "closed":
-                merged_at = (item.get("pull_request") or {}).get("merged_at")
-                state_action = "merged" if merged_at else "closed"
-
-            # 1) 优先展示“这次更新”的内容，而不是 Issue/PR 的原始描述
-            new_review = None
-            if (
-                kind == "pr"
-                and self.poll_comments
-                and review_fetches < self.max_items_per_check
-            ):
-                review_fetches += 1
-                reviews = await self.api.list_reviews(repo, number)
-                if reviews is None and self.api.last_error:
-                    logger.warning(
-                        "获取 %s#%s 的审查记录失败（%s），本轮保留水位线",
-                        repo,
-                        number,
-                        self.api.last_error,
-                    )
-                    return [], False
-                for review in reviews or []:
-                    submitted = parse_time(review.get("submitted_at"))
-                    if submitted is not None and submitted > since:
-                        new_review = review
-                        break
-
-            new_comment = None
-            if self.poll_comments and comment_fetches < self.max_items_per_check:
-                comment_fetches += 1
-                comment = await self.api.get_latest_comment(
-                    repo, number, since_param
-                )
-                if comment is None and self.api.last_error:
-                    # 评论请求失败：整轮作废，保留水位线下轮重试，避免漏掉这条评论
-                    logger.warning(
-                        "获取 %s#%s 的评论失败（%s），本轮保留水位线",
-                        repo,
-                        number,
-                        self.api.last_error,
-                    )
-                    return [], False
-                comment_time = parse_time((comment or {}).get("created_at"))
-                if comment and comment_time is not None and comment_time > since:
-                    new_comment = comment
-
-            # 关闭 / 合并时先查出“是谁关的”，评论 + 关闭同时发生也能用上
-            closer = None
-            if state_action is not None and event_fetches < self.max_items_per_check:
-                event_fetches += 1
-                issue_events = await self.api.list_issue_events(repo, number)
-                if issue_events:
-                    closer = self._find_closer(issue_events, since)
-
-            if new_review is not None:
-                action = "review"
-                body = str(new_review.get("body") or "").strip()
-                state = str(new_review.get("state") or "").upper()
-                if not body:
-                    body = {
-                        "APPROVED": "审查通过，没有留下评论。",
-                        "CHANGES_REQUESTED": "请求修改，没有留下评论。",
-                        "COMMENTED": "留下了审查意见。",
-                    }.get(state, "提交了一次审查。")
-                body_label = "审查"
-                actor = str(
-                    (new_review.get("user") or {}).get("login") or actor
-                )
-                url = str(new_review.get("html_url") or url)
-            elif new_comment is not None:
-                comment_author = str(
-                    (new_comment.get("user") or {}).get("login") or actor
-                )
-                body = str(new_comment.get("body") or "")
-                body_label = "评论"
-                actor = comment_author
-                url = str(new_comment.get("html_url") or url)
-                # 同一个窗口里既评论又关闭/合并：状态优先，评论作为正文一起带上
-                if state_action is not None:
-                    action = state_action
-                    if closer:
-                        actor = closer
-                        if comment_author != closer:
-                            body_label = f"评论（{comment_author}）"
-                else:
-                    action = "comment"
-            elif is_new:
-                action = "opened"
-            elif state_action is not None:
-                # 关闭 / 合并本身就是要推送的信息，不再重复贴原始描述
-                action = state_action
-                body = ""
-                body_label = "状态"
-                if closer:
-                    actor = closer
-            else:
-                # 2) 其它更新：用 issue events 描述具体变化；
-                #    拿不到具体变化就不推，避免把原始描述当成“本次更新”
-                description = None
-                if event_fetches < self.max_items_per_check:
-                    event_fetches += 1
-                    issue_events = await self.api.list_issue_events(repo, number)
-                    if issue_events is None:
-                        logger.warning(
-                            "获取 %s#%s 的事件失败（%s），跳过本条更新",
-                            repo,
-                            number,
-                            self.api.last_error or "未知原因",
-                        )
-                    else:
-                        description = self._describe_recent_events(issue_events, since)
-                if not description:
-                    logger.debug("跳过 %s#%s 的更新：无法确定具体变化", repo, number)
-                    continue
-                body = description
-                body_label = "变更内容"
-
-            events.append(
-                {
-                    "kind": kind,
-                    "repo": repo,
-                    "action": action,
-                    "actor": actor,
-                    # 评论 / 审查 / 关闭类事件：操作人 → 原作者
-                    # （操作人就是原作者时，渲染层会自动退化成单头像）
-                    "target": (
-                        author
-                        if action
-                        in {
-                            "review",
-                            "review_comment",
-                            "comment",
-                            "comment_edited",
-                            "closed",
-                            "merged",
-                            "reopened",
-                        }
-                        else ""
-                    ),
-                    "title": str(item.get("title") or ""),
-                    "number": number,
-                    "body": body,
-                    "body_label": body_label,
-                    "url": url,
-                }
-            )
-
-        return events, True
 
     # ------------------------------------------------------------------ 发送
 
@@ -1098,7 +959,7 @@ class GitHubLingPlugin(Star):
             return
 
         image: str | None = None
-        if self.send_card_image:
+        if self.cfg.send_card_image:
             image = await self._render_card_image(event)
 
         plain = None
@@ -1106,8 +967,8 @@ class GitHubLingPlugin(Star):
             plain = cards.render_event(
                 event,
                 markdown=False,
-                line_limit=self.comment_line_limit,
-                max_commits=self.max_commits_per_card,
+                line_limit=self.cfg.comment_line_limit,
+                max_commits=self.cfg.max_commits_per_card,
             )
 
         for subscriber in subscribers:
@@ -1158,7 +1019,7 @@ class GitHubLingPlugin(Star):
         优先使用插件内置的 Pillow 渲染器（米白毛玻璃风格，不依赖网络）；
         失败或配置为 markdown 时退回 AstrBot 的文转图服务。
         """
-        if self.card_style == "ling":
+        if self.cfg.card_style == "ling":
             avatar_path = None
             target_avatar_path = None
             try:
@@ -1181,9 +1042,9 @@ class GitHubLingPlugin(Star):
                     asyncio.to_thread(
                         card_render.render_card_file,
                         event,
-                        line_limit=self.comment_line_limit,
-                        max_commits=self.max_commits_per_card,
-                        width=self.card_width,
+                        line_limit=self.cfg.comment_line_limit,
+                        max_commits=self.cfg.max_commits_per_card,
+                        width=self.cfg.card_width,
                         avatar_path=avatar_path,
                         target_avatar_path=target_avatar_path,
                     ),
@@ -1199,8 +1060,8 @@ class GitHubLingPlugin(Star):
             markdown = cards.render_event(
                 event,
                 markdown=True,
-                line_limit=self.comment_line_limit,
-                max_commits=self.max_commits_per_card,
+                line_limit=self.cfg.comment_line_limit,
+                max_commits=self.cfg.max_commits_per_card,
             )
             image = await asyncio.wait_for(
                 self.text_to_image(markdown), timeout=CARD_RENDER_TIMEOUT

@@ -7,7 +7,7 @@
 * 右侧：类型图标 + 仓库名 + 副标题、大标题、Markdown 渲染后的正文
 
 本模块只依赖 Pillow，不联网、不需要 AstrBot 的文转图服务，
-因此在任何服务器上都能稳定出图。字符串内容由 ``cards.py`` 的语义提供。
+因此在任何服务器上都能稳定出图。字符串内容由 ``render/markdown.py`` 的语义提供。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from typing import Any, Iterable
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from . import rich_body
-from .utils import short_sha
+from ..core.texts import short_sha
 
 # ---------------------------------------------------------------- 版式常量
 

@@ -5,12 +5,14 @@
 - **Commit**：卡片展示短哈希 + 提交信息（`feat: xxx` / `fix: xxx`），一次推送多个提交时合并为一张卡片。
 - **PR / Issue**：卡片顶部是大标题，下面展示评论（或描述）的**前 10 行**，超出部分提示省略行数。
 - 支持**轮询**（默认，无需公网）与 **Webhook**（实时、评论更全面）两种模式。
-- 卡片使用 AstrBot 内置文转图服务渲染；渲染失败时自动退回纯文本。
+- 卡片使用插件内置的 Pillow 渲染器出图；渲染失败时自动退回纯文本。
+- **自动发 Issue**：引用一条消息（日志、合并转发的聊天记录、报错截图）后发送 `/ghissue`，
+  大模型会按仓库的 Issue 模板整理成草稿，确认后连同截图一起提交到 GitHub。
 
 ## 安装
 
 把整个 `astrbot_plugin_github_ling` 文件夹放到 AstrBot 的 `data/plugins/` 目录下，
-在管理面板重载插件即可。无需额外依赖（`aiohttp` 为 AstrBot 自带）。
+在管理面板重载插件即可。无需额外依赖（`aiohttp`、`Pillow`、`PyYAML` 都随 AstrBot 安装）。
 
 - 插件图标：根目录的 **`logo.png`**（AstrBot 只识别这个文件名，重载后才会读取）
 - 显示名称：`metadata.yaml` 里的 `display_name: Github 读写插件 - 灵`
@@ -25,6 +27,9 @@
 | `/ghunbind [用户名/仓库名]` | 取消绑定；省略参数则取消当前会话的全部绑定 |
 | `/ghbindlist` | 查看当前会话绑定的仓库 |
 | `/ghpush on` / `off` / `list` | 把**当前会话**（通常是某个群）加入/移出额外推送目标，查看全部目标 |
+| `/ghissue [说明]` | 引用一条消息后发送，由大模型生成 Issue 草稿（详见下文） |
+| `/ghissue ok` / `cancel` | 确认创建 / 放弃草稿 |
+| `/ghissue tpl 序号` / `list` | 换模板重新生成 / 查看仓库的 Issue 模板 |
 | `/ghcheck` | 立即检查一次更新（轮询模式） |
 | `/ghrewind [分钟]` | 把当前会话的水位线回退 N 分钟（默认 10），找回漏掉的更新 |
 | `/ghstatus` | 查看运行模式、间隔、Token、代理、API 连通性与剩余额度 |
@@ -64,6 +69,66 @@
 - 和已绑定的会话重复时自动去重，不会推两遍；
 - 目标失效（退群、封号）只会在日志里报错，不影响其他会话的推送。
 
+## 自动发 Issue（大模型）
+
+把群里的「报错现场」直接整理成 Issue：引用一条消息（可以是日志、合并转发的聊天记录、
+带报错截图的图片消息），发送 `/ghissue` 即可。
+
+```
+1. /ghbind owner/repo                 # 先在当前会话绑定仓库（自动发 Issue 只操作已绑定的仓库）
+2. 引用一条群友的消息，发送 /ghissue 这个报错了
+3. 机器人回复草稿（标题 / 正文 / 标签 / 截图数量）
+4. /ghissue ok                         # 确认创建
+```
+
+**能收集到哪些内容**
+
+- 引用消息的正文、发送者昵称；
+- 引用消息如果是**合并转发的聊天记录**，会递归展开所有节点（含嵌套转发），每行带发送者昵称；
+- 引用消息和当前消息里的图片 / 报错截图；
+- 命令后面附带的补充说明，例如 `/ghissue 复现步骤是打开设置页`；
+- 可以同时用 `/ghissue -r owner/repo 说明` 指定仓库，`-t 2` 指定模板序号。
+
+**模板**
+
+插件会读取仓库的 `.github/ISSUE_TEMPLATE`：
+
+- `.md` 模板：front matter 里的 `name` / `about` / `labels` + 正文骨架；
+- `.yml` / `.yaml` 表单模板：把 `textarea` / `input` / `dropdown` / `checkboxes` /
+  `markdown` 字段拼成 `### 字段名` 的 Markdown 骨架；
+- 仓库没有模板时使用内置的「发生了什么 / 复现步骤 / 期望行为 / 环境信息」骨架。
+
+多个模板时由模型选择最匹配的一个（`issue_template_auto`），也可以用 `/ghissue list`
+查看列表、`/ghissue tpl 2` 换模板重新生成。
+
+**确认与发布**
+
+草稿默认先发回会话，`/ghissue ok` 才会真正提交；`/ghissue cancel` 放弃；草稿 15 分钟后过期。
+创建失败（例如 Token 没有 issue 权限）时草稿会保留，可以改配置后重试。
+把 `issue_require_confirm` 关掉就会跳过确认直接创建。
+
+**截图怎么进 Issue**
+
+GitHub 的 Issue 正文只接受图片 URL，没有公开的“上传附件”接口。插件采用 Git Data API：
+把图片作为 blob 提交到目标仓库的一个**专门分支**（默认 `ling-assets`，按 `issue-assets/年月/`
+分目录，文件名是内容哈希，重复图片不会重复提交），再把 `raw.githubusercontent.com` 链接放进正文。
+
+- 需要 Token 对目标仓库有 **Contents 写权限**；没有时 Issue 仍会创建，只是正文里注明“截图上传失败”；
+- 不想让仓库多一个分支：把 `issue_asset_mode` 设为 `none`；
+- 想集中存放：把 `issue_asset_repo` 指向一个专门的图床仓库；
+- 私有仓库的 raw 链接需要登录才能查看，别人看不到截图是正常现象。
+
+**权限**
+
+默认只有管理员能用（`issue_admin_only`）。判定依据是 AstrBot 的 `admins_id` 列表，
+或平台返回的管理员身份。关掉它则会话里的所有人都可以用。
+
+**模型**
+
+使用 AstrBot 当前会话的默认对话模型；也可以在 `issue_llm_provider` 里指定一个提供商 ID。
+模型需要能按要求输出 JSON；要读懂截图还需要模型支持图片输入——不支持时会自动退回纯文本重试，
+正文里会缺截图中的信息。
+
 ## 配置
 
 | 配置项 | 默认值 | 说明 |
@@ -80,8 +145,19 @@
 | `max_commits_per_card` | `5` | 单张提交卡片最多展示的提交数 |
 | `poll_comments` | `true` | 轮询时为有更新的 Issue/PR 额外请求一条最新评论 |
 | `max_items_per_check` | `3` | 单轮最多为多少个 Issue/PR 拉取最新评论（保护 API 限额） |
-| `push_targets` | 空 | 额外推送目标（群聊 / 私聊），详见下文「推送到指定群聊」 |
+| `push_targets` | 空 | 额外推送目标（群聊 / 私聊），详见上文「推送到指定群聊」 |
 | `push_platform` | 空 | `push_targets` 用简写时所属的平台 ID，例如 `aiocqhttp`；留空自动推断 |
+| `issue_enabled` | `true` | 是否启用自动发 Issue |
+| `issue_admin_only` | `true` | 只有管理员能使用 `/ghissue` |
+| `issue_require_confirm` | `true` | 先生成草稿，`/ghissue ok` 后才创建 |
+| `issue_template_auto` | `true` | 多个模板时由模型选；关闭后默认用第一个 |
+| `issue_llm_provider` | 空 | 指定模型提供商 ID，留空用会话默认模型 |
+| `issue_max_context_chars` | `6000` | 聊天记录最大长度，超出截断 |
+| `issue_max_images` | `4` | 最多附带几张截图 |
+| `issue_asset_mode` | `repo` | 截图上传方式：`repo`（提交到分支）/ `none`（不上传） |
+| `issue_asset_branch` | `ling-assets` | 截图提交到哪个分支，不存在会自动创建 |
+| `issue_asset_repo` | 空 | 截图存放到哪个仓库，留空为 Issue 所在仓库 |
+| `issue_timeout` | `90` | 生成草稿的超时时间（秒） |
 | `enable_webhook` | `false` | 开启后停止轮询，改由 GitHub 主动推送 |
 | `webhook_host` / `webhook_port` / `webhook_path` | `0.0.0.0` / `6193` / `/github/webhook` | Webhook 监听参数 |
 | `webhook_secret` | 空 | 用于校验 `X-Hub-Signature-256`，强烈建议设置 |
@@ -148,7 +224,7 @@ HTTPS 中间人代理之后。按顺序尝试：
 
 ## 卡片样式
 
-默认 `card_style=ling`：插件用 Pillow 自己画图（`card_render.py`），**不依赖 AstrBot 文转图服务**。
+默认 `card_style=ling`：插件用 Pillow 自己画图（`render/card.py`），**不依赖 AstrBot 文转图服务**。
 设计参考 LingChat 的 `CharacterCard.vue`：
 
 - 米白色背景 + 白色毛玻璃面板（圆角、细描边、柔和投影），左上角猫爪品牌角标
@@ -167,7 +243,7 @@ HTTPS 中间人代理之后。按顺序尝试：
 `GET /users/{login}` 的 `avatar_url`；下载成功才落盘，缓存到 `data/github_ling_avatars/`
 （7 天过期，`data/temp` 可能被清理，所以不放那里），仍失败才用首字母占位，不影响通知。
 
-正文会先按 Markdown 排版（`rich_body.py`），不再直接画出 `##`、`**`、反引号：
+正文会先按 Markdown 排版（`render/rich_body.py`），不再直接画出 `##`、`**`、反引号：
 
 - 块级：`#` 标题、`-` 无序列表、`1.` 有序列表、`>` 引用、代码围栏、`---` 分割线
 - 行内：`**粗体**`、`` `代码` ``（带浅底）、`[文字](链接)`、`~~删除线~~`
@@ -177,10 +253,10 @@ HTTPS 中间人代理之后。按顺序尝试：
 同一个轮询窗口里既评论又关闭/合并时，合并成一张卡片：状态是 Closed / Merged，正文是那条评论。
 新评论通过 `GET /issues/{n}/comments?since=...` 获取（该接口不支持 `sort`/`direction`，必须按 `created_at` 自己取最新一条）。
 
-改样式只需要动 `card_render.py`：顶部是版式常量（`WIDTH`/`MARGIN`/`LEFT_W`/`RADIUS`）与配色表，
+改样式只需要动 `render/card.py`：顶部是版式常量（`WIDTH`/`MARGIN`/`LEFT_W`/`RADIUS`）与配色表，
 `render_card()` 里按「背景 → 毛玻璃 → 左栏 → 右栏 → 胶囊」顺序绘制。
 
-`card_style=markdown` 时退回旧方案：`cards.py` 生成 Markdown，交给 `Star.text_to_image()` 渲染，
+`card_style=markdown` 时退回旧方案：`render/markdown.py` 生成 Markdown，交给 `Star.text_to_image()` 渲染，
 视觉样式由 AstrBot 的 `data/t2i_templates/` 模板决定。渲染失败时链条是：
 内置渲染 → 文转图 → 纯文本。
 
@@ -213,14 +289,49 @@ python tools/preview_cards.py --render --render-markdown
 }
 ```
 
-删除该文件即可清空所有会话的绑定。
+删除该文件即可清空所有会话的绑定。自动发 Issue 的草稿只放在内存里（15 分钟过期），
+不会写入状态文件；重启插件会丢失未确认的草稿。
+
+## 目录结构
+
+```
+astrbot_plugin_github_ling/
+├── main.py                 # 入口：装配模块、注册命令、生命周期
+├── core/                   # 基础设施（不依赖具体业务）
+│   ├── config.py           # 配置归一化（PluginConfig）
+│   ├── state.py            # 状态文件读写
+│   ├── targets.py          # 推送目标 / 会话标识解析
+│   ├── paths.py            # 数据目录与文件名
+│   ├── texts.py            # 文本工具
+│   └── timeutil.py         # UTC 时间工具
+├── github/                 # GitHub 相关
+│   ├── client.py           # REST 客户端（读 + 少量写）
+│   ├── poller.py           # 轮询与水位线
+│   ├── events.py           # Webhook payload → 内部事件
+│   └── webhook.py          # Webhook HTTP 服务
+├── render/                 # 渲染
+│   ├── card.py             # Pillow 卡片
+│   ├── markdown.py         # Markdown / 纯文本卡片
+│   └── rich_body.py        # 富文本排版
+├── issue/                  # 自动发 Issue
+│   ├── context.py          # 引用 / 合并转发 / 截图收集
+│   ├── templates.py        # Issue 模板解析与缓存
+│   ├── agent.py            # 提示词、模型调用、JSON 解析、创建 Issue
+│   ├── assets.py           # 截图提交到分支并生成链接
+│   └── draft.py            # 草稿存储与预览
+├── tools/preview_cards.py  # 本地预览卡片
+└── metadata.yaml / _conf_schema.json / logo.png / LICENSE
+```
+
+模块之间通过 ``PluginConfig`` 与少量回调（发送、保存状态）连接：
+轮询器不知道卡片长什么样，Issue 助手也不关心推送目标，方便单独测试。
 
 ## 实现说明
 
-- 时间统一使用带时区的 UTC（`utils.parse_time`），避免本地时区与 GitHub 时间混用导致漏报。
+- 时间统一使用带时区的 UTC（`core/timeutil.py` 的 `parse_time`），避免本地时区与 GitHub 时间混用导致漏报。
 - 轮询水位线使用 **GitHub 响应头里的服务器时间**，不依赖本机时钟；请求失败的一轮**不推进水位线**，下一轮从旧位置重试，避免网络抖动期间漏掉评论。
 - 轮询水位线按仓库保存，重启后不会重复推送历史事件；首次绑定只记录时间戳，不补推旧内容。
 - 如果怀疑漏了事件，`/ghrewind 10` 回退水位线后再 `/ghcheck` 即可重新检查。
 - Webhook 先返回 `200` 再异步处理事件，避免 GitHub 的 3 秒超时重投。
-- 卡片渲染：`cards.render_event(..., markdown=True)` 生成 Markdown，交给
+- 卡片渲染：`render/markdown.py` 的 `render_event(..., markdown=True)` 生成 Markdown，交给
   `Star.text_to_image()`；失败时 `render_event(..., markdown=False)` 生成纯文本兜底。

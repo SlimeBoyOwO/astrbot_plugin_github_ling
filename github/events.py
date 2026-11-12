@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .utils import first_line
+from ..core.texts import first_line
 
 ISSUE_ACTIONS = {"opened", "closed", "reopened", "edited"}
 PR_ACTIONS = {"opened", "closed", "reopened", "edited"}

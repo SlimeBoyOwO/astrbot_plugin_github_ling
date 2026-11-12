@@ -1,7 +1,7 @@
 """生成 GitHub Ling 卡片样例（PNG / Markdown / 纯文本）。
 
-- 默认卡片由 `card_render.py` 用 Pillow 直接绘制（米白毛玻璃风格，离线可用）
-- 兜底的 Markdown / 纯文本由 `cards.py` 生成
+- 默认卡片由 `render/card.py` 用 Pillow 直接绘制（米白毛玻璃风格，离线可用）
+- 兜底的 Markdown / 纯文本由 `render/markdown.py` 生成
 
 用法::
 
@@ -28,7 +28,7 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 
-from astrbot_plugin_github_ling import cards  # noqa: E402
+from astrbot_plugin_github_ling.render import markdown as cards  # noqa: E402
 
 
 def sample_events() -> list[tuple[str, dict]]:
@@ -114,7 +114,7 @@ def render_all(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if images:
-        from astrbot_plugin_github_ling import card_render
+        from astrbot_plugin_github_ling.render import card as card_render
 
         for name, event in events:
             image = card_render.render_card(event, avatar_path=avatar)
