@@ -62,7 +62,7 @@ try:  # 全局管理员列表
 except Exception:  # pragma: no cover
     astrbot_config = None  # type: ignore[assignment]
 
-PLUGIN_VERSION = "1.6.4"
+PLUGIN_VERSION = "1.6.5"
 
 AVATAR_TTL_SECONDS = 7 * 24 * 3600
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,39}$")

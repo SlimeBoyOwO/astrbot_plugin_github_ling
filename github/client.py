@@ -27,6 +27,17 @@ from astrbot.api import logger
 API_BASE = "https://api.github.com"
 
 
+def _safe_url(url: str) -> str:
+    """日志里只保留主机和路径，避免把图片链接里的临时签名打印出来。"""
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(str(url))
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    except Exception:
+        return "<url>"
+
+
 class GitHubAPI:
     def __init__(
         self,
@@ -244,16 +255,38 @@ class GitHubAPI:
                 url,
                 timeout=aiohttp.ClientTimeout(total=timeout),
                 proxy=self.proxy or None,
+                # 部分图片 CDN（QQ / 微信）会拒绝 Python 默认 UA
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36"
+                    ),
+                    "Accept": "image/*,*/*;q=0.8",
+                },
             ) as response:
-                if response.status != 200:
-                    logger.debug("下载文件失败 %s: HTTP %s", url, response.status)
+                if response.status not in (200, 206):
+                    logger.debug(
+                        "下载文件失败 %s: HTTP %s（%s）",
+                        _safe_url(url),
+                        response.status,
+                        response.headers.get("Content-Type", ""),
+                    )
+                    return None
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+                if content_type and not content_type.startswith("image/") and "octet-stream" not in content_type:
+                    logger.debug(
+                        "下载文件失败 %s: Content-Type=%s",
+                        _safe_url(url),
+                        content_type,
+                    )
                     return None
                 data = await response.read()
                 if not data or len(data) > max_bytes:
                     return None
                 return data
         except Exception as exc:
-            logger.debug("下载文件失败 %s: %s", url, exc)
+            logger.debug("下载文件失败 %s: %s", _safe_url(url), exc)
             return None
 
     async def download(
@@ -550,17 +583,6 @@ class GitHubAPI:
     async def get_commit(self, repo: str, sha: str) -> dict[str, Any] | None:
         data = await self._request("GET", f"/repos/{repo}/git/commits/{sha}")
         return data if isinstance(data, dict) else None
-
-    async def get_base_commit(self, repo: str, branch: str) -> dict[str, Any] | None:
-        """取分支最新提交。"""
-        ref = await self.get_ref(repo, f"heads/{branch}")
-        if not isinstance(ref, dict):
-            return None
-        obj = ref.get("object") or {}
-        sha = str(obj.get("sha") or "")
-        if not sha:
-            return None
-        return await self.get_commit(repo, sha)
 
     async def create_tree(
         self,
